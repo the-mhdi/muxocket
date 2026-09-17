@@ -1,17 +1,21 @@
 package muxocket
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"io"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 var (
-	ErrSessionClosed = errors.New("session closed")
+	ErrSessionClosed = errors.New("session has been closed")
 )
+
+const maxBatchFrames int = 16 // Max frames coalesced per flush
 
 const (
 	DEFAULT_MAX_FRAME_DATA_LEN   uint32 = 32 << 10
@@ -22,14 +26,15 @@ const (
 
 const (
 	FLG_DATA uint8 = 1
-	FLG_SYN  uint8 = 2
+	FLG_NOOP uint8 = 2
 	FLG_FIN  uint8 = 3
 	FLG_PING uint8 = 4
-
-	maxBatchFrames = 64 // Max frames coalesced per flush
+	FLG_PONG uint8 = 4
 )
 
 type Session struct {
+	id string
+
 	config *Config
 	conn   io.ReadWriteCloser
 
@@ -47,9 +52,10 @@ type Session struct {
 }
 
 type Config struct {
+	SessionIDLength        uint8  //def 32byte string
 	MaxFrameDataSize       uint32 // def 32KB
-	MaxChannelDataSize     uint32 // if not set def 16KB
-	MaxWriteBufferSize     uint32
+	MaxChannelDataSize     uint32 // if not set def 32KB
+	MaxWriteBufferSize     uint32 //def 32
 	DrainChannelAfterClose bool
 	KeepAlive              bool
 	KeepAliveInterval      time.Duration
@@ -58,9 +64,10 @@ type Config struct {
 
 func DefaultConfig() *Config {
 	return &Config{
+		SessionIDLength:    32,
 		MaxFrameDataSize:   DEFAULT_MAX_FRAME_LEN,
 		MaxChannelDataSize: DEFAULT_MAX_CHANNEL_DATA_LEN,
-		MaxWriteBufferSize: 16,
+		MaxWriteBufferSize: 32,
 		KeepAlive:          true,
 		KeepAliveInterval:  10 * time.Second,
 		KeepAliveTimeout:   30 * time.Second,
@@ -86,6 +93,7 @@ func NewSession(conn io.ReadWriteCloser, cfg *Config) *Session {
 	}
 
 	s := &Session{
+		id:       genSessID(cfg.SessionIDLength),
 		config:   cfg,
 		conn:     conn,
 		channels: make(map[uint32]*Channel),
@@ -203,10 +211,24 @@ func (s *Session) readLoop() {
 			if ok {
 				ch.remoteClose()
 			}
+		case FLG_PING:
+
+			pongFrame := writeFrame{
+				flag:   FLG_PONG,
+				chID:   0,
+				pBuf:   nil,
+				length: uint32(0),
+			}
+
+			go s.writeControlFrame(pongFrame)
 
 		}
 
 	}
+}
+
+func (s *Session) ID() string {
+	return s.id
 }
 
 func (s *Session) Close() error {
@@ -282,4 +304,19 @@ func uint32ToString(n uint32) (string, bool) {
 	}
 
 	return string(buf[idx:]), true
+}
+
+func genSessID(len uint8) string {
+	return string(randomBytes(int(len)))
+}
+
+func randomBytes(length int) []byte {
+	b := make([]byte, length)
+	_, err := rand.Read(b)
+	if err != nil {
+		//panic("PANIC! crypto/rand failed, FATAL FLAW") // If the OS crypto fails, the server MUST panic.
+		log.Printf("randomBytes gen ERROR:%v \r\n", err)
+	}
+
+	return b
 }

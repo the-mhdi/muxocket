@@ -34,7 +34,7 @@ func newWriteScheduler(s *Session, conn io.Writer, queueDepth int) *writeSchedul
 		session:   s,
 		conn:      conn,
 		writes:    make(chan writeFrame, queueDepth),
-		ctrlQueue: make(chan writeFrame, 16),
+		ctrlQueue: make(chan writeFrame, 32),
 		die:       make(chan struct{}),
 	}
 

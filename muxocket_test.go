@@ -36,8 +36,8 @@ func createTCPSessionPair(t testing.TB) (*Session, *Session, func()) {
 		}
 		if tc, ok := c2.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
-			_ = tc.SetWriteBuffer(128 * 1024)
-			_ = tc.SetReadBuffer(128 * 1024)
+			//_ = tc.SetWriteBuffer(128 * 1024)
+			//_ = tc.SetReadBuffer(128 * 1024)
 		}
 		s2 = NewSession(c2, DefaultConfig())
 	}()
@@ -48,8 +48,8 @@ func createTCPSessionPair(t testing.TB) (*Session, *Session, func()) {
 	}
 	if tc, ok := c1.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
-		_ = tc.SetWriteBuffer(128 * 1024)
-		_ = tc.SetReadBuffer(128 * 1024)
+		//_ = tc.SetWriteBuffer(128 * 1024)
+		//_ = tc.SetReadBuffer(128 * 1024)
 	}
 	s1 := NewSession(c1, DefaultConfig())
 	wg.Wait()
@@ -82,8 +82,8 @@ func createRawTCPPair(t testing.TB) (net.Conn, net.Conn, func()) {
 		}
 		if tc, ok := c2.(*net.TCPConn); ok {
 			_ = tc.SetNoDelay(true)
-			_ = tc.SetWriteBuffer(128 * 1024)
-			_ = tc.SetReadBuffer(128 * 1024)
+			//_ = tc.SetWriteBuffer(128 * 1024)
+			//_ = tc.SetReadBuffer(128 * 1024)
 		}
 	}()
 
@@ -93,8 +93,8 @@ func createRawTCPPair(t testing.TB) (net.Conn, net.Conn, func()) {
 	}
 	if tc, ok := c1.(*net.TCPConn); ok {
 		_ = tc.SetNoDelay(true)
-		_ = tc.SetWriteBuffer(128 * 1024)
-		_ = tc.SetReadBuffer(128 * 1024)
+		//_ = tc.SetWriteBuffer(128 * 1024)
+		//_ = tc.SetReadBuffer(128 * 1024)
 	}
 	wg.Wait()
 
@@ -441,7 +441,7 @@ func BenchmarkThroughput_TCP(b *testing.B) {
 	ch1, _ := s1.OpenChannel("bench")
 	ch2, _ := s2.OpenChannel("bench")
 
-	chunkSize := 64 * 1024
+	chunkSize := 256 * 1024
 	buf := make([]byte, chunkSize)
 	rand.Read(buf)
 
@@ -553,10 +553,11 @@ func BenchmarkLatency_PingPong(b *testing.B) {
 func BenchmarkCompare_Throughput(b *testing.B) {
 	chunkSizes := []int{
 		4 * 1024,  // 4 KB (small packets)
-		16 * 1024, // 16 KB (default chunk size / L1 sweet spot)
-		32 * 1024, // 32 KB
+		16 * 1024, // 16 KB
+		32 * 1024, // 32 KB (default chunk size / L1 sweet spot)
 		64 * 1024, // 64 KB (large packets)
 		128 * 1024,
+		256 * 1024,
 	}
 
 	for _, size := range chunkSizes {
