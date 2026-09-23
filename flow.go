@@ -1,28 +1,295 @@
 package muxocket
 
-type Flow interface {
-	// sender side flow control.
+import (
+	"io"
+	"sync/atomic"
+)
 
-	// Blocks until at least some credit is available.
-	Acquire(n int) (int, error)
+const (
+	DefaultInitialStreamWindow  uint32 = 2 * 1024 * 1024 // 2 MB per channel
+	DefaultInitialSessionWindow uint32 = 4 * 1024 * 1024 // 4 MB per session
+	DefaultWindowUpdateRatio    uint32 = 4               // Replenish at 1/4 window consumed
+)
 
-	// Return unused acquired credit if the write didn't happen.
-	Release(n int)
+// StreamFlow manages lock-free credit-based flow control for an individual channel.
+type StreamFlow struct {
+	chID        uint32
+	channel     *Channel
+	session     *Session
+	sendCredits atomic.Int32
+	consumed    atomic.Int32
+	threshold   int32
+	updating    atomic.Uint32
+	winNotify   chan struct{}
+	waitState   atomic.Uint32
+}
 
-	// Called after bytes are actually written.
-	Sent(n int)
+func NewStreamFlow(chID uint32, initialWindow int32, ch *Channel, s *Session) *StreamFlow {
+	if initialWindow <= 0 {
+		initialWindow = int32(DefaultInitialStreamWindow)
+	}
+	thresh := initialWindow / int32(DefaultWindowUpdateRatio)
+	if thresh < 32*1024 {
+		thresh = 32 * 1024
+	}
 
-	// receiver side(inbound) flow control.
+	sf := &StreamFlow{
+		chID:      chID,
+		channel:   ch,
+		session:   s,
+		threshold: thresh,
+		winNotify: make(chan struct{}, 1),
+	}
+	sf.sendCredits.Store(initialWindow)
+	return sf
+}
 
-	// Called when bytes arrive from the peer.
-	Receive(n int) error
+// AcquireCredits attempts to deduct bandwidth from stream and session windows atomically.
+// If credits are exhausted, it parks ONLY the calling writer goroutine without blocking the session.
+func (sf *StreamFlow) AcquireCredits(desired int32) (int32, error) {
+	for {
+		if sf.channel.closed.Load() || sf.session.isClosed() {
+			return 0, io.ErrClosedPipe
+		}
 
-	// Called when the application consumes received bytes.
-	// May produce a WINDOW_UPDATE to send to the peer.
-	Consume(n int) (update uint64, ok bool)
+		cAvail := sf.sendCredits.Load()
+		sAvail := int32(1 << 30)
+		if sf.session.flow != nil && sf.session.flow.enabled {
+			sAvail = sf.session.flow.sendCredits.Load()
+		}
 
-	// Peer increased our send window.
-	Update(limit uint64)
+		avail := cAvail
+		if sAvail < avail {
+			avail = sAvail
+		}
 
-	Close() error
+		if avail <= 0 {
+			// Window exhausted: enter wait state
+			sf.waitState.Store(stateWaiting)
+
+			// Double check before sleeping to avoid lost wakeups
+			cAvail = sf.sendCredits.Load()
+			if sf.session.flow != nil && sf.session.flow.enabled {
+				sAvail = sf.session.flow.sendCredits.Load()
+			} else {
+				sAvail = 1 << 30
+			}
+			if cAvail > 0 && sAvail > 0 {
+				sf.waitState.Store(stateIdle)
+				continue
+			}
+
+			if sf.channel.closed.Load() || sf.session.isClosed() {
+				sf.waitState.Store(stateIdle)
+				return 0, io.ErrClosedPipe
+			}
+
+			// Block writer until WINDOW_UPDATE arrives or session terminates
+			select {
+			case <-sf.session.die:
+				sf.waitState.Store(stateIdle)
+				return 0, ErrSessionClosed
+			case <-sf.winNotify:
+				sf.waitState.Store(stateIdle)
+				continue
+			}
+		}
+
+		take := desired
+		if take > avail {
+			take = avail
+		}
+
+		// Deduct from session flow first (if enabled)
+		if sf.session.flow != nil && sf.session.flow.enabled {
+			if !sf.session.flow.TryDeduct(take) {
+				continue
+			}
+		}
+
+		// Deduct from channel flow
+		if !sf.TryDeduct(take) {
+			if sf.session.flow != nil && sf.session.flow.enabled {
+				sf.session.flow.Refund(take)
+			}
+			continue
+		}
+
+		return take, nil
+	}
+}
+
+func (sf *StreamFlow) TryDeduct(n int32) bool {
+	for {
+		curr := sf.sendCredits.Load()
+		if curr < n {
+			return false
+		}
+		if sf.sendCredits.CompareAndSwap(curr, curr-n) {
+			return true
+		}
+	}
+}
+
+func (sf *StreamFlow) Refund(n int32) {
+	if n <= 0 {
+		return
+	}
+	sf.sendCredits.Add(n)
+	sf.WakeWriter()
+	if sf.session.flow != nil && sf.session.flow.enabled {
+		sf.session.flow.Refund(n)
+	}
+}
+
+func (sf *StreamFlow) AddCredits(delta int32) {
+	if delta <= 0 {
+		return
+	}
+	sf.sendCredits.Add(delta)
+	sf.WakeWriter()
+}
+
+func (sf *StreamFlow) WakeWriter() {
+	if sf.waitState.Load() == stateWaiting {
+		select {
+		case sf.winNotify <- struct{}{}:
+		default:
+		}
+	}
+}
+
+// OnRead is called when data is drained from memory. It replenishes credits non-blockingly.
+func (sf *StreamFlow) OnRead(n int) {
+	if n <= 0 {
+		return
+	}
+	n32 := int32(n)
+
+	// 1. Channel-level replenishment
+	if sf.consumed.Add(n32) >= sf.threshold {
+		sf.flushUpdate()
+	}
+
+	// 2. Session-level replenishment
+	if sf.session.flow != nil && sf.session.flow.enabled {
+		sf.session.flow.OnRead(n32)
+	}
+}
+
+func (sf *StreamFlow) flushUpdate() {
+	if !sf.updating.CompareAndSwap(0, 1) {
+		return
+	}
+	defer sf.updating.Store(0)
+
+	curr := sf.consumed.Load()
+	if curr < sf.threshold {
+		return
+	}
+	delta := sf.consumed.Swap(0)
+	if delta <= 0 {
+		return
+	}
+
+	frame := writeFrame{
+		flag:   FLG_UPD,
+		chID:   sf.chID,
+		length: uint32(delta),
+		pBuf:   nil,
+	}
+
+	// Non-blocking try: if control queue is busy, keep delta for next read cycle
+	if !sf.session.writeControlFrameNonBlocking(frame) {
+		sf.consumed.Add(delta)
+	}
+}
+
+// SessionFlow manages connection-wide credit limits.
+type SessionFlow struct {
+	session     *Session
+	sendCredits atomic.Int32
+	consumed    atomic.Int32
+	threshold   int32
+	updating    atomic.Uint32
+	enabled     bool
+}
+
+func NewSessionFlow(initialWindow int32, s *Session) *SessionFlow {
+	if initialWindow <= 0 {
+		return &SessionFlow{session: s, enabled: false}
+	}
+	thresh := initialWindow / int32(DefaultWindowUpdateRatio)
+	if thresh < 64*1024 {
+		thresh = 64 * 1024
+	}
+
+	sf := &SessionFlow{
+		session:   s,
+		threshold: thresh,
+		enabled:   true,
+	}
+	sf.sendCredits.Store(initialWindow)
+	return sf
+}
+
+func (sf *SessionFlow) TryDeduct(n int32) bool {
+	for {
+		curr := sf.sendCredits.Load()
+		if curr < n {
+			return false
+		}
+		if sf.sendCredits.CompareAndSwap(curr, curr-n) {
+			return true
+		}
+	}
+}
+
+func (sf *SessionFlow) Refund(n int32) {
+	if n <= 0 {
+		return
+	}
+	sf.sendCredits.Add(n)
+	sf.session.wakeWaitingChannels()
+}
+
+func (sf *SessionFlow) AddCredits(delta int32) {
+	if delta <= 0 {
+		return
+	}
+	sf.sendCredits.Add(delta)
+	sf.session.wakeWaitingChannels()
+}
+
+func (sf *SessionFlow) OnRead(n int32) {
+	if sf.consumed.Add(n) >= sf.threshold {
+		sf.flushUpdate()
+	}
+}
+
+func (sf *SessionFlow) flushUpdate() {
+	if !sf.updating.CompareAndSwap(0, 1) {
+		return
+	}
+	defer sf.updating.Store(0)
+
+	curr := sf.consumed.Load()
+	if curr < sf.threshold {
+		return
+	}
+	delta := sf.consumed.Swap(0)
+	if delta <= 0 {
+		return
+	}
+
+	frame := writeFrame{
+		flag:   FLG_UPD,
+		chID:   0, // chID 0 represents session window
+		length: uint32(delta),
+		pBuf:   nil,
+	}
+
+	if !sf.session.writeControlFrameNonBlocking(frame) {
+		sf.consumed.Add(delta)
+	}
 }

@@ -441,7 +441,7 @@ func BenchmarkThroughput_TCP(b *testing.B) {
 	ch1, _ := s1.OpenChannel("bench")
 	ch2, _ := s2.OpenChannel("bench")
 
-	chunkSize := 256 * 1024
+	chunkSize := 32 * 1024
 	buf := make([]byte, chunkSize)
 	rand.Read(buf)
 
