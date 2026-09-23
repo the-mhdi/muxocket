@@ -12,14 +12,15 @@ import (
 )
 
 var (
-	ErrSessionClosed = errors.New("session has been closed")
+	ErrSessionClosed    = errors.New("session has been closed")
+	ErrSessionSuspended = errors.New("session is suspended awaiting reconnect")
 )
 
 const maxBatchFrames int = 16
 
 const (
 	DEFAULT_MAX_FRAME_DATA_LEN   uint32 = 32 << 10
-	DEFAULT_MAX_FRAME_LEN        uint32 = DEFAULT_MAX_FRAME_DATA_LEN + 9
+	DEFAULT_MAX_FRAME_LEN        uint32 = DEFAULT_MAX_FRAME_DATA_LEN + 17
 	DEFAULT_MAX_CHANNEL_DATA_LEN uint32 = 32 << 10
 	DEFAULT_MIN_FRAME_LEN        uint32 = 5
 )
@@ -31,35 +32,34 @@ const (
 	FLG_PING uint8 = 4
 	FLG_PONG uint8 = 5
 	FLG_UPD  uint8 = 6 // WINDOW_UPDATE
+	FLG_ACK  uint8 = 7 // ARQ ACKNOWLEDGEMENT
 )
 
 type Session struct {
-	id string
-
+	id     string
 	config *Config
+	connMu sync.RWMutex
 	conn   io.ReadWriteCloser
 
 	channelsMu sync.RWMutex
 	channels   map[uint32]*Channel
 
 	writer *writeScheduler
-
-	// Connection-level flow control
-	flow *SessionFlow
+	flow   *SessionFlow
 
 	die       chan struct{}
 	closeOnce sync.Once
 	closed    atomic.Bool
+	suspended atomic.Bool
 
-	header [9]byte
-
-	mu sync.Mutex // protects conn for concurrent writes
+	header [17]byte // 9 bytes (standard) or 17 bytes (reliable + offset)
 }
 
 type PacketFrame struct {
-	DataLength uint32 // acts as credit update value in flow control frames
+	DataLength uint32
 	Flag       uint8
 	ChID       uint32
+	Offset     uint64
 	Data       []byte
 }
 
@@ -67,25 +67,48 @@ type Config struct {
 	MaxFrameDataSize       uint32
 	MaxChannelDataSize     uint32
 	MaxWriteBufferSize     uint32
-	InitialStreamWindow    uint32 // Flow control window per channel (Default 1 MB)
-	InitialSessionWindow   uint32 // Flow control window for session (Default 4 MB)
+	InitialStreamWindow    uint32
+	InitialSessionWindow   uint32
 	DrainChannelAfterClose bool
 	KeepAlive              bool
 	KeepAliveInterval      time.Duration
 	KeepAliveTimeout       time.Duration
+
+	// Reliability Engine (ARQ)
+	Reliable          bool          // Enable ARQ, stream offsets, in-order reassembly, and ACKs
+	RetransmitTimeout time.Duration // Base RTO
+	MaxRetransmit     int           // Max attempts before closing channel
+	AckInterval       time.Duration // Delay ACK window
+
+	// Resumption Configuration
+	AllowConnectionResumption bool
+	ConnectionResumeTimeout   time.Duration
 }
 
 func DefaultConfig() *Config {
 	return &Config{
-		MaxFrameDataSize:     DEFAULT_MAX_FRAME_LEN,
-		MaxChannelDataSize:   DEFAULT_MAX_CHANNEL_DATA_LEN,
-		MaxWriteBufferSize:   32,
-		InitialStreamWindow:  DefaultInitialStreamWindow,
-		InitialSessionWindow: DefaultInitialSessionWindow,
-		KeepAlive:            true,
-		KeepAliveInterval:    10 * time.Second,
-		KeepAliveTimeout:     30 * time.Second,
+		MaxFrameDataSize:          DEFAULT_MAX_FRAME_LEN,
+		MaxChannelDataSize:        DEFAULT_MAX_CHANNEL_DATA_LEN,
+		MaxWriteBufferSize:        32,
+		InitialStreamWindow:       DefaultInitialStreamWindow,
+		InitialSessionWindow:      DefaultInitialSessionWindow,
+		KeepAlive:                 true,
+		KeepAliveInterval:         10 * time.Second,
+		KeepAliveTimeout:          30 * time.Second,
+		Reliable:                  true,
+		RetransmitTimeout:         150 * time.Millisecond,
+		MaxRetransmit:             8,
+		AckInterval:               10 * time.Millisecond,
+		AllowConnectionResumption: false,
+		ConnectionResumeTimeout:   5 * time.Second,
 	}
+}
+
+func (s *Session) headerLen() int {
+	if s.config.Reliable {
+		return 17
+	}
+	return 9
 }
 
 func NewSession(conn io.ReadWriteCloser, cfg *Config) *Session {
@@ -109,6 +132,14 @@ func NewSessionWithID(conn io.ReadWriteCloser, cfg *Config, id string) *Session 
 		cfg.InitialSessionWindow = DefaultInitialSessionWindow
 	}
 
+	if cfg.RetransmitTimeout == 0 {
+		cfg.RetransmitTimeout = 150 * time.Millisecond
+	}
+
+	if cfg.MaxRetransmit == 0 {
+		cfg.MaxRetransmit = 8
+	}
+
 	s := &Session{
 		id:       id,
 		config:   cfg,
@@ -123,6 +154,7 @@ func NewSessionWithID(conn io.ReadWriteCloser, cfg *Config, id string) *Session 
 	go s.readLoop()
 	return s
 }
+
 func (s *Session) OpenChannel(label string) (*Channel, error) {
 	if s.isClosed() {
 		return nil, ErrSessionClosed
@@ -179,7 +211,6 @@ func (s *Session) writeControlFrame(f writeFrame) error {
 	}
 }
 
-// writeControlFrameNonBlocking ensures Read() never blocks if ctrlQueue is saturated
 func (s *Session) writeControlFrameNonBlocking(f writeFrame) bool {
 	if s.isClosed() {
 		return false
@@ -190,15 +221,32 @@ func (s *Session) writeControlFrameNonBlocking(f writeFrame) bool {
 	case s.writer.ctrlQueue <- f:
 		return true
 	default:
-		return false
+		// Fallback to async delivery to prevent flow control deadlocks
+		go func() {
+			select {
+			case <-s.die:
+			case s.writer.ctrlQueue <- f:
+			}
+		}()
+		return true
 	}
 }
 
 func (s *Session) readLoop() {
-	defer s.Close()
+	hdrLen := s.headerLen()
+
 	for {
-		_, err := io.ReadFull(s.conn, s.header[:])
+		s.connMu.RLock()
+		c := s.conn
+		s.connMu.RUnlock()
+
+		if c == nil || s.isClosed() {
+			return
+		}
+
+		_, err := io.ReadFull(c, s.header[:hdrLen])
 		if err != nil {
+			s.handleDisconnect()
 			return
 		}
 
@@ -206,19 +254,26 @@ func (s *Session) readLoop() {
 		FRAME_FLAG := s.header[4]
 		channelID := binary.BigEndian.Uint32(s.header[5:9])
 
+		var offset uint64
+		if s.config.Reliable {
+			offset = binary.BigEndian.Uint64(s.header[9:17])
+		}
+
 		switch FRAME_FLAG {
 		case FLG_DATA:
 			if DataLength == 0 {
 				continue
 			}
 			if DataLength > s.config.MaxFrameDataSize {
+				s.handleDisconnect()
 				return
 			}
 
 			pNewbuf := defaultAllocator.Get(int(DataLength))
-			_, err := io.ReadFull(s.conn, *pNewbuf)
+			_, err := io.ReadFull(c, *pNewbuf)
 			if err != nil {
 				defaultAllocator.Put(pNewbuf)
+				s.handleDisconnect()
 				return
 			}
 
@@ -227,11 +282,25 @@ func (s *Session) readLoop() {
 			s.channelsMu.RUnlock()
 
 			if ok {
-				if err := ch.Feed(pNewbuf); err != nil {
-					defaultAllocator.Put(pNewbuf)
+				if s.config.Reliable {
+					ch.feedReliable(offset, pNewbuf, DataLength)
+				} else {
+					if err := ch.Feed(pNewbuf); err != nil {
+						defaultAllocator.Put(pNewbuf)
+					}
 				}
 			} else {
 				defaultAllocator.Put(pNewbuf)
+			}
+
+		case FLG_ACK:
+			if s.config.Reliable {
+				s.channelsMu.RLock()
+				ch, ok := s.channels[channelID]
+				s.channelsMu.RUnlock()
+				if ok {
+					ch.onAck(offset)
+				}
 			}
 
 		case FLG_UPD:
@@ -269,6 +338,54 @@ func (s *Session) readLoop() {
 	}
 }
 
+func (s *Session) handleDisconnect() {
+	if !s.config.AllowConnectionResumption || s.isClosed() {
+		s.Close()
+		return
+	}
+
+	s.connMu.Lock()
+	if s.conn != nil {
+		s.conn.Close()
+		s.conn = nil
+	}
+	s.connMu.Unlock()
+
+	s.suspended.Store(true)
+
+	// Grace period timer for reconnection
+	go func() {
+		select {
+		case <-s.die:
+			return
+		case <-time.After(s.config.ConnectionResumeTimeout):
+			if s.suspended.Load() {
+				s.Close()
+			}
+		}
+	}()
+}
+
+func (s *Session) resumeWithConnection(conn io.ReadWriteCloser) {
+	s.connMu.Lock()
+	s.conn = conn
+	s.connMu.Unlock()
+
+	s.writer.alterConn(conn)
+	s.suspended.Store(false)
+
+	// Retransmit any unacknowledged frames across all channels
+	if s.config.Reliable {
+		s.channelsMu.RLock()
+		for _, ch := range s.channels {
+			ch.retransmitAllUnacked()
+		}
+		s.channelsMu.RUnlock()
+	}
+
+	go s.readLoop()
+}
+
 func (s *Session) wakeWaitingChannels() {
 	s.channelsMu.RLock()
 	for _, ch := range s.channels {
@@ -304,21 +421,24 @@ func (s *Session) Close() error {
 		}
 
 		s.writer.Close()
-		s.conn.Close()
+
+		s.connMu.Lock()
+		if s.conn != nil {
+			s.conn.Close()
+		}
+		s.connMu.Unlock()
 	})
 	return nil
 }
 
 func (s *Session) getConn() io.ReadWriteCloser {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.connMu.RLock()
+	defer s.connMu.RUnlock()
 	return s.conn
 }
 
 func (s *Session) alterConnection(conn io.ReadWriteCloser) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.conn = conn
+	s.resumeWithConnection(conn)
 }
 
 func stringToUint32(s string) (uint32, bool) {

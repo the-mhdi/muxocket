@@ -11,7 +11,6 @@ const (
 	DefaultWindowUpdateRatio    uint32 = 4               // Replenish at 1/4 window consumed
 )
 
-// StreamFlow manages lock-free credit-based flow control for an individual channel.
 type StreamFlow struct {
 	chID        uint32
 	channel     *Channel
@@ -28,9 +27,10 @@ func NewStreamFlow(chID uint32, initialWindow int32, ch *Channel, s *Session) *S
 	if initialWindow <= 0 {
 		initialWindow = int32(DefaultInitialStreamWindow)
 	}
+
 	thresh := initialWindow / int32(DefaultWindowUpdateRatio)
-	if thresh < 32*1024 {
-		thresh = 32 * 1024
+	if thresh <= 0 {
+		thresh = 1
 	}
 
 	sf := &StreamFlow{
@@ -44,8 +44,6 @@ func NewStreamFlow(chID uint32, initialWindow int32, ch *Channel, s *Session) *S
 	return sf
 }
 
-// AcquireCredits attempts to deduct bandwidth from stream and session windows atomically.
-// If credits are exhausted, it parks ONLY the calling writer goroutine without blocking the session.
 func (sf *StreamFlow) AcquireCredits(desired int32) (int32, error) {
 	for {
 		if sf.channel.closed.Load() || sf.session.isClosed() {
@@ -64,10 +62,8 @@ func (sf *StreamFlow) AcquireCredits(desired int32) (int32, error) {
 		}
 
 		if avail <= 0 {
-			// Window exhausted: enter wait state
 			sf.waitState.Store(stateWaiting)
 
-			// Double check before sleeping to avoid lost wakeups
 			cAvail = sf.sendCredits.Load()
 			if sf.session.flow != nil && sf.session.flow.enabled {
 				sAvail = sf.session.flow.sendCredits.Load()
@@ -84,7 +80,6 @@ func (sf *StreamFlow) AcquireCredits(desired int32) (int32, error) {
 				return 0, io.ErrClosedPipe
 			}
 
-			// Block writer until WINDOW_UPDATE arrives or session terminates
 			select {
 			case <-sf.session.die:
 				sf.waitState.Store(stateIdle)
@@ -100,14 +95,12 @@ func (sf *StreamFlow) AcquireCredits(desired int32) (int32, error) {
 			take = avail
 		}
 
-		// Deduct from session flow first (if enabled)
 		if sf.session.flow != nil && sf.session.flow.enabled {
 			if !sf.session.flow.TryDeduct(take) {
 				continue
 			}
 		}
 
-		// Deduct from channel flow
 		if !sf.TryDeduct(take) {
 			if sf.session.flow != nil && sf.session.flow.enabled {
 				sf.session.flow.Refund(take)
@@ -159,19 +152,16 @@ func (sf *StreamFlow) WakeWriter() {
 	}
 }
 
-// OnRead is called when data is drained from memory. It replenishes credits non-blockingly.
 func (sf *StreamFlow) OnRead(n int) {
 	if n <= 0 {
 		return
 	}
 	n32 := int32(n)
 
-	// 1. Channel-level replenishment
 	if sf.consumed.Add(n32) >= sf.threshold {
 		sf.flushUpdate()
 	}
 
-	// 2. Session-level replenishment
 	if sf.session.flow != nil && sf.session.flow.enabled {
 		sf.session.flow.OnRead(n32)
 	}
@@ -199,13 +189,9 @@ func (sf *StreamFlow) flushUpdate() {
 		pBuf:   nil,
 	}
 
-	// Non-blocking try: if control queue is busy, keep delta for next read cycle
-	if !sf.session.writeControlFrameNonBlocking(frame) {
-		sf.consumed.Add(delta)
-	}
+	sf.session.writeControlFrameNonBlocking(frame)
 }
 
-// SessionFlow manages connection-wide credit limits.
 type SessionFlow struct {
 	session     *Session
 	sendCredits atomic.Int32
@@ -219,9 +205,10 @@ func NewSessionFlow(initialWindow int32, s *Session) *SessionFlow {
 	if initialWindow <= 0 {
 		return &SessionFlow{session: s, enabled: false}
 	}
+
 	thresh := initialWindow / int32(DefaultWindowUpdateRatio)
-	if thresh < 64*1024 {
-		thresh = 64 * 1024
+	if thresh <= 0 {
+		thresh = 1
 	}
 
 	sf := &SessionFlow{
@@ -284,12 +271,10 @@ func (sf *SessionFlow) flushUpdate() {
 
 	frame := writeFrame{
 		flag:   FLG_UPD,
-		chID:   0, // chID 0 represents session window
+		chID:   0,
 		length: uint32(delta),
 		pBuf:   nil,
 	}
 
-	if !sf.session.writeControlFrameNonBlocking(frame) {
-		sf.consumed.Add(delta)
-	}
+	sf.session.writeControlFrameNonBlocking(frame)
 }

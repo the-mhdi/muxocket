@@ -27,6 +27,11 @@ import (
 	"sync"
 )
 
+const (
+	// MaxAllocSize defines the maximum buffer size supported (256 KB = 262,144 bytes = 2^18)
+	MaxAllocSize = 256 * 1024
+)
+
 var (
 	defaultAllocator *Allocator
 	debruijnPos      = [...]byte{0, 9, 1, 10, 13, 21, 2, 29, 11, 14, 16, 18, 22, 25, 3, 30, 8, 12, 20, 28, 15, 17, 24, 7, 19, 27, 23, 6, 26, 5, 4, 31}
@@ -41,12 +46,13 @@ type Allocator struct {
 	buffers []sync.Pool
 }
 
-// NewAllocator initiates a []byte allocator for frames less than 65536 bytes,
-// the waste(memory fragmentation) of space allocation is guaranteed to be
+// NewAllocator initiates a []byte allocator for frames up to 262,144 bytes (256 KB),
+// the waste (memory fragmentation) of space allocation is guaranteed to be
 // no more than 50%.
 func NewAllocator() *Allocator {
 	alloc := new(Allocator)
-	alloc.buffers = make([]sync.Pool, 17) // 1B -> 64K
+	// 19 pools: 2^0 (1B) through 2^18 (256KB)
+	alloc.buffers = make([]sync.Pool, 19)
 	for k := range alloc.buffers {
 		i := k
 		alloc.buffers[k].New = func() any {
@@ -57,9 +63,9 @@ func NewAllocator() *Allocator {
 	return alloc
 }
 
-// Get a []byte from pool with most appropriate cap
+// Get a []byte from pool with most appropriate cap (up to 256 KB)
 func (alloc *Allocator) Get(size int) *[]byte {
-	if size <= 0 || size > 65536 {
+	if size <= 0 || size > MaxAllocSize {
 		return nil
 	}
 
@@ -81,7 +87,7 @@ func (alloc *Allocator) Put(p *[]byte) error {
 		return errors.New("allocator Put() incorrect buffer size")
 	}
 	bits := msb(cap(*p))
-	if cap(*p) == 0 || cap(*p) > 65536 || cap(*p) != 1<<bits {
+	if cap(*p) == 0 || cap(*p) > MaxAllocSize || cap(*p) != 1<<bits {
 		return errors.New("allocator Put() incorrect buffer size")
 	}
 	alloc.buffers[bits].Put(p)

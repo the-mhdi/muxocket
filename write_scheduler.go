@@ -6,6 +6,7 @@ import (
 	"net"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 type writeFrame struct {
@@ -13,10 +14,25 @@ type writeFrame struct {
 	length uint32
 	chID   uint32
 	flag   uint8
+	offset uint64 // 64-bit stream offset
+
+}
+type unackedFrame struct {
+	pBuf        *[]byte
+	offset      uint64
+	length      uint32
+	sentAt      time.Time
+	retransmits int
 }
 
+type reorderFrame struct {
+	pBuf   *[]byte
+	offset uint64
+	length uint32
+}
 type writeScheduler struct {
 	session   *Session
+	connMu    sync.RWMutex
 	conn      io.Writer
 	writes    chan writeFrame
 	ctrlQueue chan writeFrame
@@ -34,7 +50,7 @@ func newWriteScheduler(s *Session, conn io.Writer, queueDepth int) *writeSchedul
 		session:   s,
 		conn:      conn,
 		writes:    make(chan writeFrame, queueDepth),
-		ctrlQueue: make(chan writeFrame, 32),
+		ctrlQueue: make(chan writeFrame, 64),
 		die:       make(chan struct{}),
 	}
 
@@ -43,19 +59,26 @@ func newWriteScheduler(s *Session, conn io.Writer, queueDepth int) *writeSchedul
 	return ws
 }
 
+func (ws *writeScheduler) alterConn(conn io.Writer) {
+	ws.connMu.Lock()
+	ws.conn = conn
+	ws.connMu.Unlock()
+}
+
 func (ws *writeScheduler) writeLoop() {
 	defer ws.wg.Done()
 
 	var (
-		hdrs      [maxBatchFrames][9]byte
+		hdrs      [maxBatchFrames][17]byte
 		rawBufs   [maxBatchFrames * 2][]byte
 		frameRefs [maxBatchFrames]writeFrame
 	)
 
+	hdrLen := ws.session.headerLen()
+
 	for {
 		var firstFrame writeFrame
 
-		// 1. Session-level control frames (PING, etc.) have priority
 		select {
 		case <-ws.die:
 			ws.drainAndCleanup()
@@ -77,7 +100,6 @@ func (ws *writeScheduler) writeLoop() {
 		frameRefs[0] = firstFrame
 		batchCount := 1
 
-		// 2. Coalesce up to maxBatchFrames
 		for batchCount < maxBatchFrames {
 			select {
 			case cf := <-ws.ctrlQueue:
@@ -101,25 +123,40 @@ func (ws *writeScheduler) writeLoop() {
 			h[4] = f.flag
 			binary.BigEndian.PutUint32(h[5:9], f.chID)
 
-			bufSlice = append(bufSlice, h[:])
+			if ws.session.config.Reliable {
+				binary.BigEndian.PutUint64(h[9:17], f.offset)
+			}
+
+			bufSlice = append(bufSlice, h[:hdrLen])
 			if f.length > 0 && f.pBuf != nil {
 				bufSlice = append(bufSlice, (*f.pBuf)[:f.length])
 			}
 		}
 
-		netBuf := net.Buffers(bufSlice)
-		_, err := netBuf.WriteTo(ws.conn)
+		ws.connMu.RLock()
+		writer := ws.conn
+		ws.connMu.RUnlock()
 
+		if writer == nil {
+			continue
+		}
+
+		netBuf := net.Buffers(bufSlice)
+		_, err := netBuf.WriteTo(writer)
+
+		// Deallocate slab buffers immediately ONLY if ARQ is disabled.
+		// If ARQ is active, slab buffers remain referenced in unacked queue.
 		for i := 0; i < batchCount; i++ {
 			if frameRefs[i].pBuf != nil {
-				defaultAllocator.Put(frameRefs[i].pBuf)
+				if !ws.session.config.Reliable || frameRefs[i].flag != FLG_DATA {
+					defaultAllocator.Put(frameRefs[i].pBuf)
+				}
 				frameRefs[i].pBuf = nil
 			}
 		}
 
 		if err != nil {
-			go ws.session.Close()
-			ws.drainAndCleanup()
+			ws.session.handleDisconnect()
 			return
 		}
 	}
@@ -129,7 +166,7 @@ func (ws *writeScheduler) drainAndCleanup() {
 	for {
 		select {
 		case f := <-ws.writes:
-			if f.pBuf != nil {
+			if f.pBuf != nil && !ws.session.config.Reliable {
 				defaultAllocator.Put(f.pBuf)
 			}
 		case cf := <-ws.ctrlQueue:
