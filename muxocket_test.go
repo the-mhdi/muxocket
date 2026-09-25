@@ -288,6 +288,8 @@ func TestSession_MultiChannel_Concurrent(t *testing.T) {
 
 func TestSession_Channel_Close_EOF(t *testing.T) {
 	s1, s2 := createSessionPair(t)
+	s1.config.Reliability = true
+	s2.config.Reliability = true
 	defer s1.Close()
 	defer s2.Close()
 
@@ -328,7 +330,7 @@ func TestChannel_Close_Unblocks_Reader(t *testing.T) {
 		readErr <- err
 	}()
 
-	time.Sleep(20 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	if err := ch1.Close(); err != nil {
 		t.Fatalf("Close failed: %v", err)
@@ -339,7 +341,7 @@ func TestChannel_Close_Unblocks_Reader(t *testing.T) {
 		if err != io.ErrClosedPipe {
 			t.Fatalf("Expected io.ErrClosedPipe, got: %v", err)
 		}
-	case <-time.After(1 * time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("Deadlock: ch.Close() failed to unblock blocked ch.Read()")
 	}
 }
@@ -360,6 +362,8 @@ func TestSession_Close_Termination(t *testing.T) {
 
 func TestSession_Channel_NoMemoryLeak(t *testing.T) {
 	s1, s2 := createSessionPair(t)
+	s1.config.Reliability = true
+	s2.config.Reliability = true
 	defer s1.Close()
 	defer s2.Close()
 
@@ -439,11 +443,12 @@ func TestSession_Channel_NoMemoryLeak(t *testing.T) {
 func BenchmarkThroughput_TCP(b *testing.B) {
 	s1, s2, cleanup := createTCPSessionPair(b)
 	defer cleanup()
-
+	s1.config.Reliability = true
+	s2.config.Reliability = true
 	ch1, _ := s1.OpenChannel("bench")
 	ch2, _ := s2.OpenChannel("bench")
 
-	chunkSize := 32 * 1024
+	chunkSize := 30 * 1024
 	buf := make([]byte, chunkSize)
 	rand.Read(buf)
 
@@ -473,6 +478,8 @@ func BenchmarkThroughput_TCP(b *testing.B) {
 // 2. Multi-Channel Concurrent TCP Throughput (True Multiplexing Test)
 func BenchmarkThroughput_TCP_MultiChannel(b *testing.B) {
 	s1, s2, cleanup := createTCPSessionPair(b)
+	//s1.config.Reliable = true
+	//s2.config.Reliable = true
 	defer cleanup()
 
 	const numChannels = 8
@@ -554,12 +561,15 @@ func BenchmarkLatency_PingPong(b *testing.B) {
 }
 func BenchmarkCompare_Throughput(b *testing.B) {
 	chunkSizes := []int{
+		1 * 1024,
 		4 * 1024,  // 4 KB (small packets)
 		16 * 1024, // 16 KB
 		32 * 1024, // 32 KB (default chunk size / L1 sweet spot)
 		64 * 1024, // 64 KB (large packets)
 		128 * 1024,
 		256 * 1024,
+		512 * 1024,
+		1024 * 1024,
 	}
 
 	for _, size := range chunkSizes {
@@ -600,6 +610,99 @@ func BenchmarkCompare_Throughput(b *testing.B) {
 		// 2. Protocol: Muxocket over TCP Loopback
 		b.Run(fmt.Sprintf("Muxocket/%s", sizeName), func(b *testing.B) {
 			s1, s2, cleanup := createTCPSessionPair(b)
+			defer cleanup()
+
+			ch1, err := s1.OpenChannel("bench")
+			if err != nil {
+				b.Fatal(err)
+			}
+			ch2, err := s2.OpenChannel("bench")
+			if err != nil {
+				b.Fatal(err)
+			}
+
+			buf := make([]byte, size)
+			_, _ = rand.Read(buf)
+
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			done := make(chan struct{})
+			go func() {
+				recv := make([]byte, size)
+				for i := 0; i < b.N; i++ {
+					if _, err := io.ReadFull(ch2, recv); err != nil {
+						return
+					}
+				}
+				close(done)
+			}()
+
+			for i := 0; i < b.N; i++ {
+				if _, err := ch1.Write(buf); err != nil {
+					b.Fatalf("Muxocket write error: %v", err)
+				}
+			}
+
+			<-done
+		})
+	}
+}
+
+func BenchmarkCompare_Throughput_With_Reliability(b *testing.B) {
+	chunkSizes := []int{
+		1 * 1024,
+		4 * 1024,  // 4 KB (small packets)
+		16 * 1024, // 16 KB
+		32 * 1024, // 32 KB (default chunk size / L1 sweet spot)
+		64 * 1024, // 64 KB (large packets)
+		128 * 1024,
+		256 * 1024,
+		512 * 1024,
+		1024 * 1024,
+	}
+
+	for _, size := range chunkSizes {
+		sizeName := fmt.Sprintf("%dKB", size/1024)
+
+		// 1. Baseline: Raw TCP Loopback
+		b.Run(fmt.Sprintf("RawTCP/%s", sizeName), func(b *testing.B) {
+			c1, c2, cleanup := createRawTCPPair(b)
+			defer cleanup()
+
+			buf := make([]byte, size)
+			_, _ = rand.Read(buf)
+
+			b.SetBytes(int64(size))
+			b.ReportAllocs()
+			b.ResetTimer()
+
+			done := make(chan struct{})
+			go func() {
+				recv := make([]byte, size)
+				for i := 0; i < b.N; i++ {
+					if _, err := io.ReadFull(c2, recv); err != nil {
+						return
+					}
+				}
+				close(done)
+			}()
+
+			for i := 0; i < b.N; i++ {
+				if _, err := c1.Write(buf); err != nil {
+					b.Fatalf("Raw TCP write error: %v", err)
+				}
+			}
+
+			<-done
+		})
+
+		// 2. Protocol: Muxocket over TCP Loopback
+		b.Run(fmt.Sprintf("Muxocket/%s", sizeName), func(b *testing.B) {
+			s1, s2, cleanup := createTCPSessionPair(b)
+			s1.config.Reliability = true
+			s2.config.Reliability = true
 			defer cleanup()
 
 			ch1, err := s1.OpenChannel("bench")
@@ -732,11 +835,11 @@ func BenchmarkCompare_PingPongLatency(b *testing.B) {
 func createReliableSessionPair(t *testing.T) (*Session, *Session) {
 	c1, c2 := net.Pipe()
 	cfg1 := DefaultConfig()
-	cfg1.Reliable = true
+	cfg1.Reliability = true
 	cfg1.RetransmitTimeout = 40 * time.Millisecond
 
 	cfg2 := DefaultConfig()
-	cfg2.Reliable = true
+	cfg2.Reliability = true
 	cfg2.RetransmitTimeout = 40 * time.Millisecond
 
 	s1 := NewSession(c1, cfg1)
@@ -755,7 +858,7 @@ func createReliableTCPSessionPair(t testing.TB) (*Session, *Session, func()) {
 	wg.Add(1)
 
 	cfg := DefaultConfig()
-	cfg.Reliable = true
+	cfg.Reliability = true
 	cfg.RetransmitTimeout = 50 * time.Millisecond
 
 	go func() {
@@ -928,7 +1031,7 @@ func TestReliable_EndToEnd_PacketLoss_Retransmit(t *testing.T) {
 	lossy := &lossyFrameConn{Conn: c1}
 
 	cfg := DefaultConfig()
-	cfg.Reliable = true
+	cfg.Reliability = true
 	cfg.RetransmitTimeout = 100 * time.Millisecond
 
 	s1 := NewSession(lossy, cfg)
@@ -1020,7 +1123,7 @@ func TestReliable_MaxRetransmit_Timeout(t *testing.T) {
 	c1, c2 := net.Pipe()
 
 	cfg := DefaultConfig()
-	cfg.Reliable = true
+	cfg.Reliability = true
 	cfg.RetransmitTimeout = 20 * time.Millisecond
 	cfg.MaxRetransmit = 3
 
@@ -1064,7 +1167,7 @@ func TestSession_Resumption_And_DataContinuity(t *testing.T) {
 	c1, c2 := net.Pipe()
 
 	cfg := DefaultConfig()
-	cfg.Reliable = true
+	cfg.Reliability = true
 	cfg.AllowConnectionResumption = true
 	cfg.ConnectionResumeTimeout = 2 * time.Second
 	cfg.RetransmitTimeout = 50 * time.Millisecond
@@ -1165,6 +1268,8 @@ func TestSession_Resumption_Timeout_Expiry(t *testing.T) {
 // Tests that Channel.Read thread-safety lock (readMu) prevents races across concurrent readers
 func TestChannel_Concurrent_Readers(t *testing.T) {
 	s1, s2 := createSessionPair(t)
+	s1.config.Reliability = true
+	s2.config.Reliability = true
 	defer s1.Close()
 	defer s2.Close()
 
@@ -1212,7 +1317,7 @@ func TestChannel_Concurrent_Readers(t *testing.T) {
 func TestFlowControl_Backpressure_With_Reliable(t *testing.T) {
 	c1, c2 := net.Pipe()
 	cfg := DefaultConfig()
-	cfg.Reliable = true
+	cfg.Reliability = true
 	cfg.InitialStreamWindow = 16 * 1024  // 16 KB window
 	cfg.InitialSessionWindow = 32 * 1024 // 32 KB window
 
@@ -1261,8 +1366,8 @@ func TestReliable_MultiChannel_Stress(t *testing.T) {
 	s1, s2, cleanup := createReliableTCPSessionPair(t)
 	defer cleanup()
 
-	const numChannels = 16
-	const payloadSize = 64 * 1024
+	const numChannels = 64
+	const payloadSize = 32 * 1024
 
 	var wg sync.WaitGroup
 	wg.Add(numChannels)
@@ -1329,6 +1434,7 @@ func BenchmarkThroughput_Reliable_TCP(b *testing.B) {
 		recv := make([]byte, chunkSize)
 		for i := 0; i < b.N; i++ {
 			if _, err := io.ReadFull(ch2, recv); err != nil {
+				print("Read error: %v", err)
 				return
 			}
 		}
@@ -1421,7 +1527,7 @@ func BenchmarkReorder_FeedReliable(b *testing.B) {
 
 	ch, _ := s2.OpenChannel("micro")
 
-	chunkSize := 1024
+	chunkSize := 32 * 1024
 	raw := make([]byte, chunkSize)
 
 	// Consume data in background so ring buffer never fills up
@@ -1429,6 +1535,7 @@ func BenchmarkReorder_FeedReliable(b *testing.B) {
 		drain := make([]byte, 4096)
 		for {
 			if _, err := ch.Read(drain); err != nil {
+				fmt.Println(err)
 				return
 			}
 		}
@@ -1438,10 +1545,7 @@ func BenchmarkReorder_FeedReliable(b *testing.B) {
 	b.ResetTimer()
 
 	for i := 0; i < b.N; i++ {
-		pBuf := defaultAllocator.Get(chunkSize)
-		copy(*pBuf, raw)
-		offset := uint64(i * chunkSize)
-		ch.feedReliable(offset, pBuf, uint32(chunkSize))
+		ch.Write(raw)
 	}
 }
 

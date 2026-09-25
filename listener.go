@@ -83,7 +83,8 @@ func (ln *Listener) Accept() (*Session, error) {
 }
 
 // initator sends: porotocol versoin[1byte]:sessionID[max32bytes,all 0 if it's a fresh start]:nonce[2 bytes]((it's 0 for a new session)(increments evey time session gets resumed)):random[32byte of random bytes]:pubkeyLen[1byte]:sessoinPublickey[max 128 bytes(1024 bits)]:sigLen[1byte]:signature[max 256 bytes]
-// responder sends: protocol version[1byte]:sessionID[max32bytes]:nonce[2 bytes]: responderpubkey and signature
+// responder sends: protocol version[1byte]:sessionID[max32bytes]:nonce[2 bytes]:windowsize and capabilities: responderpubkey and signature
+// initator starts the session based on the responder's handshake message and the capabilities it advertises. If the responder's handshake message is invalid, the initator closes the connection and returns an error.
 func (ln *Listener) handshake(conn net.Conn) (*activeSession, error) {
 	conn.SetDeadline(time.Now().Add(ln.handshakeTimeout))
 
@@ -248,7 +249,8 @@ func (ln *Listener) deleteSession(ID string) {
 }
 
 type initiatorHandshakeMessage struct {
-	length          uint16
+	length uint16
+
 	ProtocolVersion uint8
 	SessionID       [32]byte
 	Nonce           uint16
@@ -275,9 +277,17 @@ func parseInitiatorHandshakeMessage(data []byte) (*initiatorHandshakeMessage, er
 }
 
 type responderHandshakeMessage struct {
+	length          uint16
 	ProtocolVersion uint8
-	SessionID       [32]byte
-	Nonce           uint16
-	PublicKey       []byte
-	Signature       []byte
+
+	InitialStreamWindow       uint32
+	InitialSessionWindow      uint32
+	WindowUpdateRatio         uint32
+	MaxFrameDataLen           uint32
+	Reliability               bool
+	AllowConnectionResumption bool
+	SessionID                 [32]byte
+	Nonce                     uint16
+	PublicKey                 []byte
+	Signature                 []byte
 }

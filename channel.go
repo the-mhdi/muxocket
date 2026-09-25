@@ -16,8 +16,9 @@ type Channel struct {
 	id      uint32
 	session *Session
 
-	ring      RingBuffer
-	notify    chan struct{}
+	ring   RingBuffer
+	notify chan struct{}
+
 	waitState atomic.Uint32 // stateIdle or stateWaiting (for Read)
 	reading   atomic.Int32
 	readMu    sync.Mutex // Guarantees thread-safe consumer reads on ring buffer
@@ -25,16 +26,20 @@ type Channel struct {
 	flow *StreamFlow
 
 	closeOnce sync.Once
+	closeChan chan struct{} // Closed once to broadcast-unblock all readers & writers
+	drainOnce sync.Once
 	closed    atomic.Bool // Local write/read closed
 	readDone  atomic.Bool // Remote peer closed (FIN received)
 
 	// Reliability Engine (ARQ & In-Order Reassembly)
-	writeOffset uint64 // Tracks local contiguous byte stream position
-	readOffset  uint64 // Tracks contiguous byte stream delivered to user
+	writeOffset uint64
+	readOffset  uint64
 	unackedMu   sync.Mutex
 	unacked     []*unackedFrame
 	reorderMu   sync.Mutex
 	reorderMap  map[uint64]*reorderFrame
+	finOffset   uint64
+	hasFin      bool
 }
 
 func newChannel(id uint32, session *Session) *Channel {
@@ -43,12 +48,13 @@ func newChannel(id uint32, session *Session) *Channel {
 		session:    session,
 		ring:       NewBufferRing(8),
 		notify:     make(chan struct{}, 1),
+		closeChan:  make(chan struct{}), // Initialize broadcast channel
 		reorderMap: make(map[uint64]*reorderFrame),
 	}
 	ch.closed.Store(false)
 	ch.flow = NewStreamFlow(id, int32(session.config.InitialStreamWindow), ch, session)
 
-	if session.config.Reliable {
+	if session.config.Reliability {
 		go ch.arqLoop()
 	}
 
@@ -63,7 +69,7 @@ func (c *Channel) Write(b []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 
-	maxChunk := int(c.session.config.MaxChannelDataSize)
+	maxChunk := int(c.session.config.MaxFrameDataSize)
 	totalSent := 0
 
 	for len(b) > 0 {
@@ -92,7 +98,7 @@ func (c *Channel) Write(b []byte) (int, error) {
 		}
 
 		// Track in unacked queue prior to transmission if ARQ is active
-		if c.session.config.Reliable {
+		if c.session.config.Reliability {
 			c.unackedMu.Lock()
 			c.unacked = append(c.unacked, &unackedFrame{
 				pBuf:        pBuf,
@@ -105,7 +111,7 @@ func (c *Channel) Write(b []byte) (int, error) {
 		}
 
 		if err := c.session.writeDataFrame(frame); err != nil {
-			if !c.session.config.Reliable {
+			if !c.session.config.Reliability {
 				defaultAllocator.Put(pBuf)
 			}
 			c.flow.Refund(sz)
@@ -127,16 +133,16 @@ func (c *Channel) Read(b []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 
-	// Protect consumer invariants in SPSC RingBuffer
 	c.readMu.Lock()
 	defer c.readMu.Unlock()
 
 	c.reading.Add(1)
 	defer func() {
-		c.reading.Add(-1)
+
 		if c.closed.Load() || c.session.isClosed() {
 			c.drainRing()
 		}
+		c.reading.Add(-1)
 	}()
 
 	totalRead := 0
@@ -208,7 +214,11 @@ func (c *Channel) Read(b []byte) (int, error) {
 			return 0, io.EOF
 		}
 
-		<-c.notify
+		select {
+		case <-c.notify:
+		case <-c.closeChan:
+			return 0, io.ErrClosedPipe
+		}
 		c.waitState.Store(stateIdle)
 	}
 }
@@ -231,14 +241,21 @@ func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
 		c.readOffset += uint64(length)
 
 		// Drain contiguous backlog
-		for {
-			nextFrame, exists := c.reorderMap[c.readOffset]
-			if !exists {
-				break
+		if len(c.reorderMap) > 0 {
+			for {
+				nextFrame, exists := c.reorderMap[c.readOffset]
+				if !exists {
+					break
+				}
+				delete(c.reorderMap, c.readOffset)
+				c.Feed(nextFrame.pBuf)
+				c.readOffset += uint64(nextFrame.length)
 			}
-			delete(c.reorderMap, c.readOffset)
-			c.Feed(nextFrame.pBuf)
-			c.readOffset += uint64(nextFrame.length)
+		}
+
+		// If FIN was previously received and all gaps are now filled, close the stream
+		if c.hasFin && c.readOffset >= c.finOffset {
+			c.remoteClose()
 		}
 
 		c.sendAck(c.readOffset)
@@ -388,18 +405,34 @@ func (c *Channel) wakeReader() {
 
 func (c *Channel) Close() error {
 	var err error
+	if c.closed.Load() == true {
+		return nil
+	}
+
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
+		close(c.closeChan) // 1. Broadcast to instantly unblock all writers and readers
 
 		c.wakeReader()
+
 		c.flow.WakeWriter()
 
-		err = c.session.writeDataFrame(writeFrame{
+		finalOffset := atomic.LoadUint64(&c.writeOffset)
+
+		frame := writeFrame{
 			flag:   FLG_FIN,
 			chID:   c.id,
 			pBuf:   nil,
 			length: 0,
-		})
+			offset: finalOffset,
+		}
+
+		// 2. Do not block indefinitely if the write queue is saturated
+		if !c.session.writeDataFrameNonBlocking(frame) {
+			go func() {
+				_ = c.session.writeDataFrame(frame)
+			}()
+		}
 
 		if c.reading.Load() == 0 {
 			c.drainRing()
@@ -407,8 +440,10 @@ func (c *Channel) Close() error {
 
 		if c.readDone.Load() {
 			c.cleanupReliability()
+
 			c.session.removeChannel(c.id)
 		}
+
 	})
 	return err
 }
@@ -464,13 +499,34 @@ func (c *Channel) cleanupReliability() {
 }
 
 func (c *Channel) drainRing() {
-	for {
-		_, head, ok := c.ring.Pop()
-		if !ok {
-			break
+	c.drainOnce.Do(func() {
+		var discardedBytes int32
+		for {
+			buf, head, ok := c.ring.Pop()
+			if !ok {
+				break
+			}
+			discardedBytes += int32(len(buf))
+			if head != nil {
+				defaultAllocator.Put(head)
+			}
 		}
-		if head != nil {
-			defaultAllocator.Put(head)
+
+		// Replenish the connection-wide session window for discarded data!
+		if discardedBytes > 0 && c.session.flow != nil && c.session.flow.enabled {
+			c.session.flow.OnRead(discardedBytes)
 		}
+	})
+}
+
+func (c *Channel) handleFinReliable(finOffset uint64) {
+	c.reorderMu.Lock()
+	c.hasFin = true
+	c.finOffset = finOffset
+	shouldClose := c.readOffset >= finOffset
+	c.reorderMu.Unlock() // Unlock before triggering remoteClose to prevent self-deadlock
+
+	if shouldClose {
+		c.remoteClose()
 	}
 }

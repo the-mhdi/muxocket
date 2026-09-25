@@ -7,7 +7,7 @@ import (
 
 const (
 	DefaultInitialStreamWindow  uint32 = 2 * 1024 * 1024 // 2 MB per channel
-	DefaultInitialSessionWindow uint32 = 4 * 1024 * 1024 // 4 MB per session
+	DefaultInitialSessionWindow uint32 = 4 * 1024 * 1024 // 8 MB per session
 	DefaultWindowUpdateRatio    uint32 = 4               // Replenish at 1/4 window consumed
 )
 
@@ -20,7 +20,6 @@ type StreamFlow struct {
 	threshold   int32
 	updating    atomic.Uint32
 	winNotify   chan struct{}
-	waitState   atomic.Uint32
 }
 
 func NewStreamFlow(chID uint32, initialWindow int32, ch *Channel, s *Session) *StreamFlow {
@@ -46,6 +45,7 @@ func NewStreamFlow(chID uint32, initialWindow int32, ch *Channel, s *Session) *S
 
 func (sf *StreamFlow) AcquireCredits(desired int32) (int32, error) {
 	for {
+		// Fast exit if channel or session was closed
 		if sf.channel.closed.Load() || sf.session.isClosed() {
 			return 0, io.ErrClosedPipe
 		}
@@ -62,30 +62,18 @@ func (sf *StreamFlow) AcquireCredits(desired int32) (int32, error) {
 		}
 
 		if avail <= 0 {
-			sf.waitState.Store(stateWaiting)
-
-			cAvail = sf.sendCredits.Load()
-			if sf.session.flow != nil && sf.session.flow.enabled {
-				sAvail = sf.session.flow.sendCredits.Load()
-			} else {
-				sAvail = 1 << 30
-			}
-			if cAvail > 0 && sAvail > 0 {
-				sf.waitState.Store(stateIdle)
-				continue
-			}
-
+			// Double check under race before sleeping
 			if sf.channel.closed.Load() || sf.session.isClosed() {
-				sf.waitState.Store(stateIdle)
 				return 0, io.ErrClosedPipe
 			}
 
+			// Block writer until WINDOW_UPDATE arrives, channel closes, or session dies
 			select {
 			case <-sf.session.die:
-				sf.waitState.Store(stateIdle)
 				return 0, ErrSessionClosed
+			case <-sf.channel.closeChan: // Instantly unblocks when Channel.Close() is called!
+				return 0, io.ErrClosedPipe
 			case <-sf.winNotify:
-				sf.waitState.Store(stateIdle)
 				continue
 			}
 		}
@@ -95,12 +83,14 @@ func (sf *StreamFlow) AcquireCredits(desired int32) (int32, error) {
 			take = avail
 		}
 
+		// Deduct from session flow first
 		if sf.session.flow != nil && sf.session.flow.enabled {
 			if !sf.session.flow.TryDeduct(take) {
 				continue
 			}
 		}
 
+		// Deduct from stream flow
 		if !sf.TryDeduct(take) {
 			if sf.session.flow != nil && sf.session.flow.enabled {
 				sf.session.flow.Refund(take)
@@ -144,11 +134,9 @@ func (sf *StreamFlow) AddCredits(delta int32) {
 }
 
 func (sf *StreamFlow) WakeWriter() {
-	if sf.waitState.Load() == stateWaiting {
-		select {
-		case sf.winNotify <- struct{}{}:
-		default:
-		}
+	select {
+	case sf.winNotify <- struct{}{}:
+	default:
 	}
 }
 
@@ -189,7 +177,10 @@ func (sf *StreamFlow) flushUpdate() {
 		pBuf:   nil,
 	}
 
-	sf.session.writeControlFrameNonBlocking(frame)
+	// If control queue was busy, restore delta so credits are NEVER lost!
+	if !sf.session.writeControlFrameNonBlocking(frame) {
+		sf.consumed.Add(delta)
+	}
 }
 
 type SessionFlow struct {
@@ -276,5 +267,8 @@ func (sf *SessionFlow) flushUpdate() {
 		pBuf:   nil,
 	}
 
-	sf.session.writeControlFrameNonBlocking(frame)
+	// If control queue was busy, restore delta so session credits are NEVER lost!
+	if !sf.session.writeControlFrameNonBlocking(frame) {
+		sf.consumed.Add(delta)
+	}
 }
