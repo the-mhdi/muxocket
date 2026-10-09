@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"testing"
@@ -408,39 +409,51 @@ func TestListener_SessionResumption_Success(t *testing.T) {
 
 	// Read server confirmation
 
+	done := make(chan error, 1)
 	go func() {
-		var lenBuf [2]byte
-		if _, err := io.ReadFull(conn2, lenBuf[:]); err != nil {
-			t.Fatalf("Failed to read server resumption response len: %v", err)
-		}
-		respLen := binary.BigEndian.Uint16(lenBuf[:])
-		respBuf := make([]byte, respLen)
-		if _, err := io.ReadFull(conn2, respBuf); err != nil {
-			t.Fatalf("Failed to read server resumption response: %v", err)
-		}
+		done <- func() error {
+			var lenBuf [2]byte
+			if _, err := io.ReadFull(conn2, lenBuf[:]); err != nil {
+				return fmt.Errorf("read server resumption response len: %w", err)
+			}
+			respLen := binary.BigEndian.Uint16(lenBuf[:])
+			respBuf := make([]byte, respLen)
+			if _, err := io.ReadFull(conn2, respBuf); err != nil {
+				return fmt.Errorf("read server resumption response: %w", err)
+			}
 
-		resumeResp, err := parseResponderHandshakeMessage(respBuf)
-		if err != nil {
-			t.Fatalf("parseResponderHandshakeMessage failed: %v", err)
-		}
+			resumeResp, err := parseResponderHandshakeMessage(respBuf)
+			if err != nil {
+				return fmt.Errorf("parseResponderHandshakeMessage: %w", err)
+			}
 
-		if resumeResp.Nonce != 1 {
-			t.Fatalf("Expected responder nonce 1, got %d", resumeResp.Nonce)
-		}
+			if resumeResp.Nonce != 1 {
+				return fmt.Errorf("expected responder nonce 1, got %d", resumeResp.Nonce)
+			}
 
-		// Apply new connection to the existing client session
-		sessClient.alterConnection(conn2)
+			// Apply new connection to the existing client session
+			sessClient.alterConnection(conn2)
 
-		// Verify channel can still write post-resumption
-		if _, err := chClient.Write([]byte("data after resumption")); err != nil {
-			t.Fatalf("Write post-resumption failed: %v", err)
-		}
-
+			// Verify channel can still write post-resumption
+			if _, err := chClient.Write([]byte("data after resumption")); err != nil {
+				return fmt.Errorf("write post-resumption: %w", err)
+			}
+			return nil
+		}()
 	}()
 
 	if _, err := conn2.Write(resumePacket); err != nil {
 		t.Fatal(err)
 	}
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for resumption")
+	}
+	sessClient.Close()
 
 }
 
@@ -467,7 +480,7 @@ func TestListener_SessionResumption_ReplayAttackRejected(t *testing.T) {
 	// Pre-register active session with Nonce = 1
 	active := &activeSession{
 		id:                  sid,
-		session:             NewSessionWithID(cServer, DefaultConfig(), sid),
+		session:             NewSessionWithID(newIdleConn(t), DefaultConfig(), sid),
 		initiatorPublicKey:  clientPub,
 		responderPrivateKey: serverPriv,
 	}
@@ -506,13 +519,13 @@ func TestListener_SessionResumption_WrongKey_HijackingAttempt(t *testing.T) {
 	legitPub := legitPriv.Public().(ed25519.PublicKey)
 	_, serverPriv, _ := ed25519.GenerateKey(rand.Reader)
 
-	sid := "legitimate_session_id_32_bytes!"
+	sid := "legitimate_session_id_32_bytes!!" // must be exactly 32 bytes
 	var sidBytes [32]byte
 	copy(sidBytes[:], sid)
 
 	active := &activeSession{
 		id:                  sid,
-		session:             NewSessionWithID(cServer, DefaultConfig(), sid),
+		session:             NewSessionWithID(newIdleConn(t), DefaultConfig(), sid),
 		initiatorPublicKey:  legitPub,
 		responderPrivateKey: serverPriv,
 	}
@@ -677,4 +690,13 @@ func TestListenPacket_UDP_HandshakeAndData(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Timeout waiting for UDP server to receive message")
 	}
+}
+
+// newIdleConn returns one end of a pipe whose peer is never written to, so a
+// session built on it just sits in readLoop without touching the handshake
+// transport under test.
+func newIdleConn(t *testing.T) net.Conn {
+	a, b := net.Pipe()
+	t.Cleanup(func() { a.Close(); b.Close() })
+	return a
 }

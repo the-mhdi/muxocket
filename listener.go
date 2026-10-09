@@ -13,9 +13,12 @@ import (
 	"time"
 )
 
+// Pool stores *[]byte: putting a plain []byte into a sync.Pool boxes the
+// slice header and allocates on every Put.
 var handshakeBuffer = sync.Pool{
 	New: func() any {
-		return make([]byte, 512)
+		b := make([]byte, MaxHandshakeLen)
+		return &b
 	},
 }
 
@@ -58,9 +61,15 @@ type Listener struct {
 	peerMu     sync.RWMutex
 	peerConns  map[string]*packetSubConn // remoteAddr.String() -> *packetSubConn
 	acceptChan chan *Session
-	die        chan struct{}
-	closeOnce  sync.Once
-	closed     atomic.Bool
+	mtu        int // max datagram size (packet listeners only)
+
+	acceptOnce sync.Once
+	acceptErr  atomic.Value // error from the underlying stream listener
+	acceptDone chan struct{}
+
+	die       chan struct{}
+	closeOnce sync.Once
+	closed    atomic.Bool
 }
 
 type activeSession struct {
@@ -85,6 +94,8 @@ func Listen(listener net.Listener, config *Config) (*Listener, error) {
 		AllowConnectionResumption: true,
 		ConnectionResumeTimeout:   config.ConnectionResumeTimeout,
 		sessions:                  make(map[string]*activeSession),
+		acceptChan:                make(chan *Session, 64),
+		acceptDone:                make(chan struct{}),
 		die:                       make(chan struct{}),
 	}, nil
 }
@@ -95,19 +106,29 @@ func (ln *Listener) Close() error {
 			close(ln.die)
 		})
 
+		// Collect under the lock, close outside it: Session.Close runs the
+		// close hook which takes ln.mu (and packetSubConn.Close takes peerMu).
 		ln.mu.Lock()
+		toClose := make([]*Session, 0, len(ln.sessions))
 		for id, sess := range ln.sessions {
-			_ = sess.session.Close()
+			toClose = append(toClose, sess.session)
 			delete(ln.sessions, id)
 		}
 		ln.mu.Unlock()
+		for _, s := range toClose {
+			_ = s.Close()
+		}
 
 		ln.peerMu.Lock()
+		subs := make([]*packetSubConn, 0, len(ln.peerConns))
 		for addr, sub := range ln.peerConns {
-			_ = sub.Close()
+			subs = append(subs, sub)
 			delete(ln.peerConns, addr)
 		}
 		ln.peerMu.Unlock()
+		for _, sub := range subs {
+			_ = sub.Close()
+		}
 
 		if ln.pconn != nil {
 			return ln.pconn.Close()
@@ -124,41 +145,69 @@ func (ln *Listener) Addr() net.Addr {
 	return ln.ln.Addr()
 }
 
+// Accept returns the next established session.
+//
+// Stream listeners now perform handshakes concurrently in per-connection
+// goroutines. Previously the handshake ran inline in Accept, so one slow or
+// malicious client (holding the 5s handshake timeout) blocked every other
+// client from connecting (head-of-line blocking / trivial DoS).
 func (ln *Listener) Accept() (*Session, error) {
-	// If backed by a packet connection (UDP/IP), pull accepted sessions from acceptChan
-	if ln.pconn != nil {
-		select {
-		case <-ln.die:
-			return nil, ErrListenerClosed
-		case sess, ok := <-ln.acceptChan:
-			if !ok {
-				return nil, ErrListenerClosed
-			}
-			return sess, nil
-		}
+	if ln.pconn == nil {
+		ln.acceptOnce.Do(func() { go ln.streamAcceptLoop() })
 	}
 
-	// Stream (TCP) accept loop
+	select {
+	case <-ln.die:
+		return nil, ErrListenerClosed
+	case sess, ok := <-ln.acceptChan:
+		if !ok {
+			return nil, ErrListenerClosed
+		}
+		return sess, nil
+	case <-ln.acceptDone:
+		if err, _ := ln.acceptErr.Load().(error); err != nil {
+			return nil, err
+		}
+		return nil, ErrListenerClosed
+	}
+}
+
+func (ln *Listener) streamAcceptLoop() {
+	var backoff time.Duration
 	for {
 		conn, err := ln.ln.Accept()
 		if err != nil {
-			return nil, err
-		}
-
-		activeSess, isResumed, err := ln.handshake(conn)
-		if err != nil {
-			_ = conn.Close()
-			if ln.closed.Load() {
-				return nil, err
+			if ne, ok := err.(net.Error); ok && ne.Timeout() && !ln.closed.Load() {
+				if backoff == 0 {
+					backoff = 5 * time.Millisecond
+				} else if backoff < time.Second {
+					backoff *= 2
+				}
+				time.Sleep(backoff)
+				continue
 			}
-			continue
+			ln.acceptErr.Store(err)
+			close(ln.acceptDone)
+			return
 		}
+		backoff = 0
+		go ln.handleIncomingStreamConn(conn)
+	}
+}
 
-		if isResumed && ln.TransparentResumption {
-			continue
-		}
-
-		return activeSess.session, nil
+func (ln *Listener) handleIncomingStreamConn(conn net.Conn) {
+	activeSess, isResumed, err := ln.handshake(conn)
+	if err != nil {
+		_ = conn.Close()
+		return
+	}
+	if isResumed && ln.TransparentResumption {
+		return
+	}
+	select {
+	case <-ln.die:
+		_ = activeSess.session.Close()
+	case ln.acceptChan <- activeSess.session:
 	}
 }
 
@@ -184,8 +233,9 @@ func (ln *Listener) handshake(conn net.Conn) (*activeSession, bool, error) {
 	_ = conn.SetDeadline(time.Now().Add(ln.handshakeTimeout))
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
 
-	buf := handshakeBuffer.Get().([]byte)
-	defer handshakeBuffer.Put(buf)
+	pbuf := handshakeBuffer.Get().(*[]byte)
+	defer handshakeBuffer.Put(pbuf)
+	buf := *pbuf
 
 	var lenBuf [2]byte
 	if _, err := io.ReadFull(conn, lenBuf[:]); err != nil {
@@ -229,8 +279,10 @@ func (ln *Listener) handshake(conn net.Conn) (*activeSession, bool, error) {
 			return nil, false, ErrSessionNotFound
 		}
 
-		expectedNonce := session.nonce.Load() + 1
-		if uint32(parsedMsg.Nonce) != expectedNonce || parsedMsg.Nonce == 0 {
+		// Nonces must be strictly increasing (anti-replay). Requiring exactly
+		// last+1 made resumption fragile: if our response was lost after we
+		// bumped the nonce, the client could never resume again.
+		if uint32(parsedMsg.Nonce) <= session.nonce.Load() || parsedMsg.Nonce == 0 {
 			return nil, false, ErrInvalidNonce
 		}
 
@@ -242,7 +294,17 @@ func (ln *Listener) handshake(conn net.Conn) (*activeSession, bool, error) {
 			return nil, false, ErrInvalidSignature
 		}
 
-		session.nonce.Store(uint32(parsedMsg.Nonce))
+		// CAS loop so two concurrent resumptions can't both win with the same
+		// nonce (Load+Store was racy).
+		for {
+			cur := session.nonce.Load()
+			if uint32(parsedMsg.Nonce) <= cur {
+				return nil, false, ErrInvalidNonce
+			}
+			if session.nonce.CompareAndSwap(cur, uint32(parsedMsg.Nonce)) {
+				break
+			}
+		}
 
 		res, err := ln.buildResponderHandshake(session.id, parsedMsg.Nonce, session.responderPrivateKey)
 		if err != nil {
@@ -290,14 +352,22 @@ func (ln *Listener) handshake(conn net.Conn) (*activeSession, bool, error) {
 	s := NewSessionWithID(conn, ln.sessionConfig, sid)
 
 	activeSess := &activeSession{
-		id:                  sid,
-		session:             s,
-		initiatorPublicKey:  parsedMsg.PublicKey,
+		id:      sid,
+		session: s,
+		// MUST copy: parsedMsg.PublicKey aliases the pooled handshake buffer.
+		// Storing the alias meant the next handshake that reused the buffer
+		// overwrote this session's stored key with *its own* key - so an
+		// attacker's resumption attempt compared its key against itself and
+		// passed, i.e. full session hijack.
+		initiatorPublicKey:  append(ed25519.PublicKey(nil), parsedMsg.PublicKey...),
 		responderPrivateKey: priv,
 	}
 	activeSess.nonce.Store(0)
 
 	ln.saveSession(sid, activeSess)
+	// Without this, every session ever accepted stayed in ln.sessions forever
+	// (getSession merely hid closed ones): unbounded memory growth.
+	s.addCloseHook(func() { ln.forgetSession(sid, activeSess) })
 	return activeSess, false, nil
 }
 
@@ -380,6 +450,14 @@ func (ln *Listener) saveSession(ID string, s *activeSession) {
 	ln.sessions[ID] = s
 }
 
+func (ln *Listener) forgetSession(ID string, s *activeSession) {
+	ln.mu.Lock()
+	if cur, ok := ln.sessions[ID]; ok && cur == s {
+		delete(ln.sessions, ID)
+	}
+	ln.mu.Unlock()
+}
+
 func (ln *Listener) deleteSession(ID string) {
 	ln.mu.Lock()
 	defer ln.mu.Unlock()
@@ -388,9 +466,9 @@ func (ln *Listener) deleteSession(ID string) {
 	if !exists {
 		return
 	}
-
-	_ = s.session.Close()
 	delete(ln.sessions, ID)
+	// Close without holding ln.mu (the close hook re-acquires it).
+	go s.session.Close()
 }
 
 // ============================================================================

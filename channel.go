@@ -20,8 +20,8 @@ type Channel struct {
 	notify chan struct{}
 
 	waitState atomic.Uint32 // stateIdle or stateWaiting (for Read)
-	reading   atomic.Int32
 	readMu    sync.Mutex
+	writeMu   sync.Mutex // serialises Write so offsets/unacked stay ordered and calls don't interleave
 
 	flow *StreamFlow
 
@@ -40,6 +40,18 @@ type Channel struct {
 	reorderMap  map[uint64]*reorderFrame
 	finOffset   uint64
 	hasFin      bool
+
+	// Coalesced ACK state (see sendAck / writeLoop)
+	ackOffset  atomic.Uint64
+	ackPending atomic.Bool
+}
+
+// maxReorderBytes bounds out-of-order buffering per channel. A peer could
+// otherwise send frames at arbitrary future offsets and grow reorderMap
+// without limit (memory DoS). A well-behaved sender never has more than its
+// stream window in flight.
+func (c *Channel) maxReorderBytes() uint64 {
+	return uint64(c.session.config.InitialStreamWindow) * 2
 }
 
 func newChannel(id uint32, session *Session) *Channel {
@@ -69,6 +81,9 @@ func (c *Channel) Write(b []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+
 	maxChunk := int(c.session.config.MaxFrameDataSize)
 	totalSent := 0
 
@@ -97,22 +112,27 @@ func (c *Channel) Write(b []byte) (int, error) {
 			offset: currOffset,
 		}
 
-		// Track in unacked queue prior to transmission if ARQ is active
+		// Track in unacked queue prior to transmission if ARQ is active.
+		// refs = 2: one for the unacked queue, one for the writer.
 		if c.session.config.Reliability {
+			uf := &unackedFrame{
+				pBuf:   pBuf,
+				offset: currOffset,
+				length: uint32(sz),
+				sentAt: time.Now(),
+			}
+			uf.refs.Store(2)
+			frame.ack = uf
 			c.unackedMu.Lock()
-			c.unacked = append(c.unacked, &unackedFrame{
-				pBuf:        pBuf,
-				offset:      currOffset,
-				length:      uint32(sz),
-				sentAt:      time.Now(),
-				retransmits: 0,
-			})
+			c.unacked = append(c.unacked, uf)
 			c.unackedMu.Unlock()
 		}
 
 		if err := c.session.writeDataFrame(frame); err != nil {
-			if !c.session.config.Reliability {
-				defaultAllocator.Put(pBuf)
+			if frame.ack != nil {
+				frame.ack.release() // writer's reference; unacked keeps its own
+			} else {
+				_ = defaultAllocator.Put(pBuf)
 			}
 			c.flow.Refund(sz)
 			return totalSent, err
@@ -134,15 +154,13 @@ func (c *Channel) Read(b []byte) (int, error) {
 	}
 
 	c.readMu.Lock()
-	defer c.readMu.Unlock()
-
-	c.reading.Add(1)
 	defer func() {
-
+		// Unlock first, then re-check: either we observe closed and drain,
+		// or Close() observed the lock free and drained itself.
+		c.readMu.Unlock()
 		if c.closed.Load() || c.session.isClosed() {
-			c.drainRing()
+			c.tryDrainRing()
 		}
-		c.reading.Add(-1)
 	}()
 
 	totalRead := 0
@@ -224,68 +242,97 @@ func (c *Channel) Read(b []byte) (int, error) {
 }
 
 // feedReliable handles reordering, deduplication, and sequential assembly.
+//
+// Fixes vs. the previous version:
+//   - remoteClose() was called while holding reorderMu; when the channel was
+//     already closed locally it calls cleanupReliability(), which locks
+//     reorderMu again -> self-deadlock of the session's readLoop.
+//   - after cleanupReliability() reorderMap is nil; a late out-of-order frame
+//     panicked with "assignment to entry in nil map".
+//   - buffers rejected by feed() (closed channel) were leaked.
+//   - reorderMap was unbounded.
 func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
+	shouldClose := false
+
 	c.reorderMu.Lock()
-	defer c.reorderMu.Unlock()
+	switch {
+	case c.reorderMap == nil || c.closed.Load():
+		// Channel torn down (or closed locally); just drop it.
+		_ = defaultAllocator.Put(pBuf)
 
-	// 1. Packet already acknowledged and received
-	if offset+uint64(length) <= c.readOffset {
-		defaultAllocator.Put(pBuf)
+	case offset+uint64(length) <= c.readOffset:
+		// 1. Packet already acknowledged and received
+		_ = defaultAllocator.Put(pBuf)
 		c.sendAck(c.readOffset)
-		return
-	}
 
-	// 2. Next contiguous in-order slice
-	if offset == c.readOffset {
-		c.feed(pBuf)
+	case offset == c.readOffset:
+		// 2. Next contiguous in-order slice
+		if err := c.feed(pBuf); err != nil {
+			_ = defaultAllocator.Put(pBuf)
+		}
 		c.readOffset += uint64(length)
 
 		// Drain contiguous backlog
-		if len(c.reorderMap) > 0 {
-			for {
-				nextFrame, exists := c.reorderMap[c.readOffset]
-				if !exists {
-					break
-				}
-				delete(c.reorderMap, c.readOffset)
-				c.feed(nextFrame.pBuf)
-				c.readOffset += uint64(nextFrame.length)
+		for len(c.reorderMap) > 0 {
+			nextFrame, exists := c.reorderMap[c.readOffset]
+			if !exists {
+				break
 			}
+			delete(c.reorderMap, c.readOffset)
+			if err := c.feed(nextFrame.pBuf); err != nil {
+				_ = defaultAllocator.Put(nextFrame.pBuf)
+			}
+			c.readOffset += uint64(nextFrame.length)
 		}
 
 		// If FIN was previously received and all gaps are now filled, close the stream
-		if c.hasFin && c.readOffset >= c.finOffset {
-			c.remoteClose()
-		}
-
+		shouldClose = c.hasFin && c.readOffset >= c.finOffset
 		c.sendAck(c.readOffset)
-		return
-	}
 
-	// 3. Out-of-order slice (gap detected): buffer and issue Fast Retransmit duplicate ACK
-	if offset > c.readOffset {
-		if _, exists := c.reorderMap[offset]; !exists {
+	case offset > c.readOffset:
+		// 3. Out-of-order slice (gap detected): buffer and issue duplicate ACK
+		if offset-c.readOffset > c.maxReorderBytes() {
+			_ = defaultAllocator.Put(pBuf) // beyond any legal window
+		} else if _, exists := c.reorderMap[offset]; !exists {
 			c.reorderMap[offset] = &reorderFrame{
 				pBuf:   pBuf,
 				offset: offset,
 				length: length,
 			}
 		} else {
-			defaultAllocator.Put(pBuf)
+			_ = defaultAllocator.Put(pBuf)
 		}
 		c.sendAck(c.readOffset)
+
+	default:
+		// Partially overlapping retransmission (offset < readOffset < end).
+		// Frames are never re-chunked, so this only happens with a broken
+		// peer; drop it and re-ACK.
+		_ = defaultAllocator.Put(pBuf)
+		c.sendAck(c.readOffset)
+	}
+	c.reorderMu.Unlock()
+
+	if shouldClose {
+		c.remoteClose()
 	}
 }
 
+// sendAck publishes the latest cumulative offset and enqueues at most one ACK
+// frame per channel; the writer reads the newest offset at flush time.
 func (c *Channel) sendAck(cumulativeOffset uint64) {
-	frame := writeFrame{
-		flag:   FLG_ACK,
-		chID:   c.id,
-		offset: cumulativeOffset,
-		length: 0,
-		pBuf:   nil,
+	c.ackOffset.Store(cumulativeOffset)
+	if !c.ackPending.CompareAndSwap(false, true) {
+		return // an ACK is already queued; it will carry the new offset
 	}
-	c.session.writeControlFrameNonBlocking(frame)
+	frame := writeFrame{
+		flag:  FLG_ACK,
+		chID:  c.id,
+		ackCh: c,
+	}
+	if !c.session.writeControlFrameNonBlocking(frame) {
+		c.ackPending.Store(false)
+	}
 }
 
 // onAck releases acknowledged chunks back to the allocator.
@@ -297,10 +344,8 @@ func (c *Channel) onAck(ackOffset uint64) {
 	for idx < len(c.unacked) {
 		f := c.unacked[idx]
 		if f.offset+uint64(f.length) <= ackOffset {
-			if f.pBuf != nil {
-				defaultAllocator.Put(f.pBuf)
-				f.pBuf = nil
-			}
+			f.release()
+			c.unacked[idx] = nil // don't let the backing array pin acked frames
 			idx++
 		} else {
 			break
@@ -308,6 +353,9 @@ func (c *Channel) onAck(ackOffset uint64) {
 	}
 	if idx > 0 {
 		c.unacked = c.unacked[idx:]
+		if len(c.unacked) == 0 {
+			c.unacked = nil // drop the (possibly large) backing array
+		}
 	}
 }
 
@@ -334,53 +382,69 @@ func (c *Channel) arqLoop() {
 	}
 }
 
+// checkRetransmissions collects due frames under the lock but sends them
+// after releasing it. The old version called the blocking writeDataFrame while
+// holding unackedMu; when the write queue was full, onAck (called from
+// readLoop) blocked on the same mutex, stalling the receive path and therefore
+// the ACKs that would have drained the queue (deadlock under load).
 func (c *Channel) checkRetransmissions(rto time.Duration) {
+	var due []*unackedFrame
+	giveUp := false
+
 	c.unackedMu.Lock()
-	defer c.unackedMu.Unlock()
-
-	if len(c.unacked) == 0 {
-		return
-	}
-
 	now := time.Now()
 	for _, f := range c.unacked {
-		if now.Sub(f.sentAt) >= rto {
-			f.sentAt = now
-			f.retransmits++
-
-			if f.retransmits > c.session.config.MaxRetransmit {
-				go c.localClose()
-				return
-			}
-
-			frame := writeFrame{
-				flag:   FLG_DATA,
-				chID:   c.id,
-				pBuf:   f.pBuf,
-				length: f.length,
-				offset: f.offset,
-			}
-			c.session.writeDataFrame(frame)
+		if now.Sub(f.sentAt) < rto {
+			continue
 		}
+		f.sentAt = now
+		f.retransmits++
+		if f.retransmits > c.session.config.MaxRetransmit {
+			giveUp = true
+			break
+		}
+		f.retain() // reference held by the in-flight retransmission
+		due = append(due, f)
+	}
+	c.unackedMu.Unlock()
+
+	c.sendRetransmissions(due)
+	if giveUp {
+		go c.localClose()
 	}
 }
 
-func (c *Channel) retransmitAllUnacked() {
-	c.unackedMu.Lock()
-	defer c.unackedMu.Unlock()
-
-	now := time.Now()
-	for _, f := range c.unacked {
-		f.sentAt = now
+func (c *Channel) sendRetransmissions(due []*unackedFrame) {
+	for i, f := range due {
 		frame := writeFrame{
 			flag:   FLG_DATA,
 			chID:   c.id,
 			pBuf:   f.pBuf,
 			length: f.length,
 			offset: f.offset,
+			ack:    f,
 		}
-		c.session.writeDataFrame(frame)
+		if err := c.session.writeDataFrame(frame); err != nil {
+			for _, g := range due[i:] {
+				g.release()
+			}
+			return
+		}
 	}
+}
+
+func (c *Channel) retransmitAllUnacked() {
+	c.unackedMu.Lock()
+	now := time.Now()
+	due := make([]*unackedFrame, 0, len(c.unacked))
+	for _, f := range c.unacked {
+		f.sentAt = now
+		f.retain()
+		due = append(due, f)
+	}
+	c.unackedMu.Unlock()
+
+	c.sendRetransmissions(due)
 }
 
 func (c *Channel) feed(buffer *[]byte) error {
@@ -434,9 +498,7 @@ func (c *Channel) Close() error {
 			}()
 		}
 
-		if c.reading.Load() == 0 {
-			c.drainRing()
-		}
+		c.tryDrainRing()
 
 		if c.readDone.Load() {
 			c.cleanupReliability()
@@ -463,13 +525,12 @@ func (c *Channel) localClose() {
 	c.closeOnce.Do(func() {
 		c.closed.Store(true)
 		c.readDone.Store(true)
+		close(c.closeChan) // unblock writers parked in AcquireCredits / readers
 
 		c.wakeReader()
 		c.flow.WakeWriter()
 
-		if c.reading.Load() == 0 {
-			c.drainRing()
-		}
+		c.tryDrainRing()
 
 		c.cleanupReliability()
 		c.session.removeChannel(c.id)
@@ -478,14 +539,12 @@ func (c *Channel) localClose() {
 
 func (c *Channel) cleanupReliability() {
 	c.unackedMu.Lock()
-	for _, f := range c.unacked {
-		if f.pBuf != nil {
-			defaultAllocator.Put(f.pBuf)
-			f.pBuf = nil
-		}
-	}
+	unacked := c.unacked
 	c.unacked = nil
 	c.unackedMu.Unlock()
+	for _, f := range unacked {
+		f.release() // frames still queued in the writer keep their own ref
+	}
 
 	c.reorderMu.Lock()
 	for _, f := range c.reorderMap {
@@ -496,6 +555,17 @@ func (c *Channel) cleanupReliability() {
 	}
 	c.reorderMap = nil
 	c.reorderMu.Unlock()
+}
+
+// tryDrainRing drains the ring only if no Read is in progress. The ring is
+// single-consumer: the old `reading.Load() == 0` check raced with a Read that
+// had passed its closed-check but not yet incremented `reading`, giving two
+// concurrent consumers. An active reader drains in its own deferred cleanup.
+func (c *Channel) tryDrainRing() {
+	if c.readMu.TryLock() {
+		c.drainRing()
+		c.readMu.Unlock()
+	}
 }
 
 func (c *Channel) drainRing() {

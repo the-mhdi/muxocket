@@ -20,9 +20,8 @@ type packetSubConn struct {
 	remoteAddr net.Addr
 
 	queue     RingBuffer
-	reading   atomic.Int32
 	waitState atomic.Uint32 // stateIdle or stateWaiting (for Read)
-	readMu    sync.RWMutex
+	readMu    sync.Mutex
 	notify    chan struct{}
 	drainOnce sync.Once
 	//readDone  atomic.Bool
@@ -41,7 +40,12 @@ func newPacketSubConn(ln *Listener, raddr net.Addr) *packetSubConn {
 		ln:         ln,
 		remoteAddr: raddr,
 		queue:      NewBufferRing(8), // Datagram queue depth
-		die:        make(chan struct{}),
+		// notify was never initialised: wakeReader() sent on a nil channel
+		// (always hitting `default`) and Read blocked on a nil channel, so a
+		// waiting reader only ever woke up via its deadline. This is what
+		// hung TestListenPacket_UDP_HandshakeAndData.
+		notify: make(chan struct{}, 1),
+		die:    make(chan struct{}),
 	}
 }
 
@@ -52,11 +56,23 @@ func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Liste
 		return nil, errors.New("packetConn cannot be nil")
 	}
 
+	if MTU < 64 || MTU > 65535 || MTU > MaxAllocSize {
+		return nil, errors.New("MTU must be between 64 and 65535")
+	}
+
 	var cfg *Config
 	if len(config) > 0 && config[0] != nil {
-		cfg = config[0]
+		c := *config[0] // don't mutate the caller's config
+		cfg = &c
 	} else {
 		cfg = DefaultConfig()
+	}
+	// Every frame must fit in one datagram (header + payload <= MTU), and
+	// packetReadLoop reads into MTU-sized buffers, so larger datagrams were
+	// silently truncated. The value is advertised to the dialer in the
+	// handshake, so both directions honour it.
+	if maxData := uint32(MTU - 17); cfg.MaxFrameDataSize == 0 || cfg.MaxFrameDataSize > maxData {
+		cfg.MaxFrameDataSize = maxData
 	}
 
 	ln := &Listener{
@@ -68,6 +84,8 @@ func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Liste
 		sessions:                  make(map[string]*activeSession),
 		peerConns:                 make(map[string]*packetSubConn),
 		acceptChan:                make(chan *Session, 64),
+		acceptDone:                make(chan struct{}),
+		mtu:                       MTU,
 		die:                       make(chan struct{}),
 	}
 
@@ -102,8 +120,12 @@ func (ln *Listener) packetReadLoop(MTU int) {
 		subConn, exists := ln.peerConns[raddrStr]
 		ln.peerMu.RUnlock()
 
+		*pBuf = (*pBuf)[:n] // only hand the bytes actually received to the stream
+
 		if exists && !subConn.closed.Load() {
-			subConn.feed(pBuf)
+			if subConn.feed(pBuf) != nil {
+				_ = defaultAllocator.Put(pBuf)
+			}
 			continue
 		}
 
@@ -112,7 +134,9 @@ func (ln *Listener) packetReadLoop(MTU int) {
 		ln.peerConns[raddrStr] = newSubConn
 		ln.peerMu.Unlock()
 
-		newSubConn.feed(pBuf)
+		if newSubConn.feed(pBuf) != nil {
+			_ = defaultAllocator.Put(pBuf)
+		}
 		go ln.handleIncomingPacketConn(newSubConn)
 	}
 }
@@ -146,30 +170,28 @@ func (s *packetSubConn) Read(b []byte) (int, error) {
 	}
 
 	s.readMu.Lock()
-	defer s.readMu.Unlock()
-
-	s.reading.Add(1)
 	defer func() {
-
+		s.readMu.Unlock()
 		if s.closed.Load() || s.ln.closed.Load() {
-			s.drainRing()
+			s.tryDrainRing()
 		}
-		s.reading.Add(-1)
 	}()
 
 	totalRead := 0
 
-	for {
-		var timerCh <-chan time.Time
-		if dl := s.readDeadline.Load(); dl != nil && !dl.IsZero() {
-			d := time.Until(*dl)
-			if d <= 0 {
-				return 0, os.ErrDeadlineExceeded
-			}
-			t := time.NewTimer(d)
-			defer t.Stop()
-			timerCh = t.C
+	// One timer per Read call.
+	var timerCh <-chan time.Time
+	if dl := s.readDeadline.Load(); dl != nil && !dl.IsZero() {
+		d := time.Until(*dl)
+		if d <= 0 {
+			return 0, os.ErrDeadlineExceeded
 		}
+		t := time.NewTimer(d)
+		defer t.Stop()
+		timerCh = t.C
+	}
+
+	for {
 
 		for len(b) > 0 {
 			n, drainedBuf := s.queue.PartialRead(b)
@@ -248,42 +270,12 @@ func (s *packetSubConn) Write(b []byte) (int, error) {
 	return s.ln.pconn.WriteTo(b, s.remoteAddr)
 }
 
-// writeBuffers coalesces frame header + payload into a single UDP datagram
-func (s *packetSubConn) writeBuffers(v *net.Buffers) (int64, error) {
-	if s.closed.Load() || s.ln.closed.Load() {
-		return 0, io.ErrClosedPipe
-	}
+// maxDatagramSize makes the write scheduler pack whole frames into single
+// datagrams. The previous writeBuffers method was never called: net.Buffers
+// only recognises the net package's own unexported buffersWriter interface,
+// so header and payload went out as two separate datagrams.
+func (s *packetSubConn) maxDatagramSize() int { return s.ln.mtu }
 
-	var total int
-	for _, b := range *v {
-		total += len(b)
-	}
-	if total == 0 {
-		return 0, nil
-	}
-
-	pBuf := defaultAllocator.Get(total)
-	var buf []byte
-	if pBuf != nil {
-		buf = (*pBuf)[:total]
-		defer defaultAllocator.Put(pBuf)
-	} else {
-		buf = make([]byte, total)
-	}
-
-	offset := 0
-	for _, b := range *v {
-		copy(buf[offset:], b)
-		offset += len(b)
-	}
-
-	n, err := s.ln.pconn.WriteTo(buf, s.remoteAddr)
-	if err != nil {
-		return 0, err
-	}
-	*v = (*v)[:0]
-	return int64(n), nil
-}
 func (s *packetSubConn) LocalAddr() net.Addr  { return s.ln.pconn.LocalAddr() }
 func (s *packetSubConn) RemoteAddr() net.Addr { return s.remoteAddr }
 
@@ -308,11 +300,23 @@ func (s *packetSubConn) Close() error {
 		s.closed.Store(true)
 		close(s.die)
 
+		key := s.remoteAddr.String()
 		s.ln.peerMu.Lock()
-		delete(s.ln.peerConns, s.remoteAddr.String())
+		if cur, ok := s.ln.peerConns[key]; ok && cur == s {
+			delete(s.ln.peerConns, key)
+		}
 		s.ln.peerMu.Unlock()
+
+		s.tryDrainRing() // return queued datagram slabs to the pool
 	})
 	return nil
+}
+
+func (s *packetSubConn) tryDrainRing() {
+	if s.readMu.TryLock() {
+		s.drainRing()
+		s.readMu.Unlock()
+	}
 }
 
 func (s *packetSubConn) drainRing() {
