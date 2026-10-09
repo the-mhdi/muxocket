@@ -97,12 +97,25 @@ func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Liste
 
 // packetReadLoop reads incoming UDP datagrams and routes them to per-client subConns
 func (ln *Listener) packetReadLoop(MTU int) {
+	// Raw IPv4 sockets read the IP header (up to 60 bytes) into the buffer
+	// before ReadFrom strips it, so an MTU-sized buffer silently truncated
+	// every full-size datagram. Read with slack and drop oversized datagrams
+	// instead of feeding a truncated frame into the stream.
+	bufSize := MTU + 64
+	if bufSize > MaxAllocSize {
+		bufSize = MaxAllocSize
+	}
 	for {
 		if ln.closed.Load() {
 			return
 		}
-		pBuf := defaultAllocator.Get(MTU)
+		pBuf := defaultAllocator.Get(bufSize)
+		*pBuf = (*pBuf)[:bufSize]
 		n, raddr, err := ln.pconn.ReadFrom(*pBuf)
+		if err == nil && n > MTU {
+			defaultAllocator.Put(pBuf)
+			continue // larger than negotiated: would desync the frame stream
+		}
 		if err != nil {
 			defaultAllocator.Put(pBuf)
 			if ln.closed.Load() {
@@ -269,7 +282,11 @@ func (s *packetSubConn) Write(b []byte) (int, error) {
 	if s.closed.Load() || s.ln.closed.Load() {
 		return 0, io.ErrClosedPipe
 	}
-	return s.ln.pconn.WriteTo(b, s.remoteAddr)
+	n, err := s.ln.pconn.WriteTo(b, s.remoteAddr)
+	if err != nil && isTransientDatagramErr(err) {
+		return len(b), nil // datagram lost; not a dead peer
+	}
+	return n, err
 }
 
 // maxDatagramSize makes the write scheduler pack whole frames into single

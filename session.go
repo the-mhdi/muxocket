@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io"
 	"log"
+	"net"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +34,9 @@ const (
 	FLG_PONG uint8 = 5
 	FLG_UPD  uint8 = 6 // WINDOW_UPDATE
 	FLG_ACK  uint8 = 7 // ARQ ACKNOWLEDGEMENT
+	// FLG_GOAWAY is the last frame of a graceful Close: the peer closes the
+	// session immediately instead of suspending it for resumption.
+	FLG_GOAWAY uint8 = 8
 )
 
 type Session struct {
@@ -64,6 +68,7 @@ type Session struct {
 	rxActivity atomic.Bool
 
 	unknownChannelErrors atomic.Uint32
+	goAwayRecv           atomic.Bool
 
 	// dialer holds client-side resumption state (nil on the listener side).
 	dialer atomic.Pointer[dialer]
@@ -77,6 +82,77 @@ type Session struct {
 	arqOnce sync.Once
 	arqMu   sync.Mutex
 	arqSet  map[*Channel]struct{}
+
+	// Frames for channels this side hasn't opened yet (guarded by
+	// channelsMu). The protocol has no channel-open frame, so the peer may
+	// legitimately send before our OpenChannel; these are delivered when the
+	// channel is opened instead of being dropped.
+	pending      map[uint32][]pendingFrame
+	pendingBytes int
+}
+
+type pendingFrame struct {
+	flag   uint8
+	offset uint64
+	pBuf   *[]byte
+	length uint32
+}
+
+const (
+	maxPendingBytes    = 1 << 20 // per session
+	maxPendingChannels = 64
+)
+
+// stashLocked keeps an early frame (channelsMu held). Returns false if the
+// limits are exceeded and the frame must be dropped.
+func (s *Session) stashLocked(id uint32, f pendingFrame) bool {
+	if s.pending == nil {
+		s.pending = make(map[uint32][]pendingFrame)
+	}
+	q, ok := s.pending[id]
+	if !ok && len(s.pending) >= maxPendingChannels {
+		return false
+	}
+	if s.pendingBytes+int(f.length) > maxPendingBytes || len(q) >= 4096 {
+		return false
+	}
+	s.pending[id] = append(q, f)
+	s.pendingBytes += int(f.length)
+	return true
+}
+
+func (s *Session) deliverPending(ch *Channel, frames []pendingFrame) {
+	for _, f := range frames {
+		switch f.flag {
+		case FLG_DATA:
+			if s.config.Reliability {
+				ch.feedReliable(f.offset, f.pBuf, f.length)
+			} else if err := ch.feed(f.pBuf); err != nil {
+				_ = defaultAllocator.Put(f.pBuf)
+				s.creditDiscarded(f.length)
+			}
+		case FLG_FIN:
+			if s.config.Reliability {
+				ch.handleFinReliable(f.offset)
+			} else {
+				ch.remoteClose()
+			}
+		}
+	}
+}
+
+// Done is closed when the session is closed.
+func (s *Session) Done() <-chan struct{} { return s.die }
+
+// IsClosed reports whether the session has been closed.
+func (s *Session) IsClosed() bool { return s.isClosed() }
+
+// RemoteAddr returns the peer address of the current transport, if known.
+func (s *Session) RemoteAddr() net.Addr {
+	if c, ok := s.getConn().(interface{ RemoteAddr() net.Addr }); ok {
+		return c.RemoteAddr()
+	}
+	return nil
 }
 
 type PacketFrame struct {
@@ -206,7 +282,24 @@ func (s *Session) OpenChannel(label string) (*Channel, error) {
 	}
 
 	ch := newChannel(id, s)
+	frames := s.pending[id]
+	if frames != nil {
+		delete(s.pending, id)
+		for _, f := range frames {
+			s.pendingBytes -= int(f.length)
+		}
+		// Hold feedMu before publishing the channel: readLoop will block on it
+		// for any newer frame, so early frames are delivered first, in order.
+		ch.feedMu.Lock()
+	}
 	s.channels[id] = ch
+	s.channelsMu.Unlock()
+
+	if frames != nil {
+		s.deliverPending(ch, frames)
+		ch.feedMu.Unlock()
+	}
+	s.channelsMu.Lock() // re-acquired for the deferred Unlock
 	return ch, nil
 }
 
@@ -275,6 +368,7 @@ func (s *Session) arqLoop() {
 				ch.inARQ = false
 				s.arqRemove(ch)
 				ch.unackedMu.Unlock()
+				ch.maybeFinalize()
 			} else {
 				ch.unackedMu.Unlock()
 				ch.checkRetransmissions(rto)
@@ -294,6 +388,16 @@ func (s *Session) getChannel(id uint32) *Channel {
 func (s *Session) removeChannel(id uint32) {
 	s.channelsMu.Lock()
 	delete(s.channels, id)
+	s.channelsMu.Unlock()
+}
+
+// removeChannelIf removes id only if it still maps to ch (a new channel with
+// the same label may have been opened since).
+func (s *Session) removeChannelIf(id uint32, ch *Channel) {
+	s.channelsMu.Lock()
+	if s.channels[id] == ch {
+		delete(s.channels, id)
+	}
 	s.channelsMu.Unlock()
 }
 
@@ -426,6 +530,18 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 
 			ch := s.getChannel(channelID)
 			if ch == nil {
+				s.channelsMu.Lock()
+				ch = s.channels[channelID]
+				stashed := false
+				if ch == nil && !s.isClosed() {
+					stashed = s.stashLocked(channelID, pendingFrame{flag: FLG_DATA, offset: offset, pBuf: pNewbuf, length: dataLength})
+				}
+				s.channelsMu.Unlock()
+				if stashed {
+					continue
+				}
+			}
+			if ch == nil {
 				_ = defaultAllocator.Put(pNewbuf)
 				s.creditDiscarded(dataLength)
 				if s.unknownChannelErrors.Add(1) > s.config.MaxUnknownChannelErrors {
@@ -437,12 +553,14 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 				continue
 			}
 
+			ch.feedMu.Lock()
 			if s.config.Reliability {
 				ch.feedReliable(offset, pNewbuf, dataLength)
 			} else if err := ch.feed(pNewbuf); err != nil {
 				_ = defaultAllocator.Put(pNewbuf)
 				s.creditDiscarded(dataLength)
 			}
+			ch.feedMu.Unlock()
 
 		case FLG_ACK:
 			if s.config.Reliability {
@@ -462,12 +580,22 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 			}
 
 		case FLG_FIN:
-			if ch := s.getChannel(channelID); ch != nil {
+			ch := s.getChannel(channelID)
+			if ch == nil {
+				s.channelsMu.Lock()
+				if ch = s.channels[channelID]; ch == nil && !s.isClosed() {
+					s.stashLocked(channelID, pendingFrame{flag: FLG_FIN, offset: offset})
+				}
+				s.channelsMu.Unlock()
+			}
+			if ch != nil {
+				ch.feedMu.Lock()
 				if s.config.Reliability {
 					ch.handleFinReliable(offset)
 				} else {
 					ch.remoteClose()
 				}
+				ch.feedMu.Unlock()
 			}
 
 		case FLG_PING:
@@ -477,6 +605,11 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 			case s.writer.ctrlQueue <- writeFrame{flag: FLG_PONG}:
 			default:
 			}
+
+		case FLG_GOAWAY:
+			s.goAwayRecv.Store(true)
+			s.Close()
+			return
 
 		case FLG_PONG, FLG_NOOP:
 			// liveness only (rxActivity already recorded)
@@ -534,7 +667,8 @@ func (s *Session) handleDisconnect(failed io.ReadWriteCloser) {
 		return
 	}
 	if !s.config.AllowConnectionResumption {
-		s.Close()
+		// Async: we may be on the writer goroutine, and Close waits for it.
+		go s.Close()
 		return
 	}
 
@@ -651,13 +785,32 @@ func (s *Session) Close() error {
 			activeChannels = append(activeChannels, ch)
 		}
 		s.channels = make(map[uint32]*Channel)
+		for _, q := range s.pending {
+			for _, f := range q {
+				if f.pBuf != nil {
+					_ = defaultAllocator.Put(f.pBuf)
+				}
+			}
+		}
+		s.pending = nil
+		s.pendingBytes = 0
 		s.channelsMu.Unlock()
 
+		graceful := s.goAwayRecv.Load()
 		for _, ch := range activeChannels {
-			ch.localClose()
+			if graceful {
+				ch.peerGone()
+			} else {
+				ch.localClose()
+			}
 		}
 
 		s.writer.Close()
+		// Let the writer flush queued frames + GOAWAY (bounded).
+		select {
+		case <-s.writer.exited:
+		case <-time.After(2 * gracefulFlushTimeout):
+		}
 
 		s.connMu.Lock()
 		if s.conn != nil {

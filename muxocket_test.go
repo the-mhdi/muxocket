@@ -391,7 +391,7 @@ func TestSession_Channel_NoMemoryLeak(t *testing.T) {
 
 		recvBuf := make([]byte, len(msg))
 		if _, err := io.ReadFull(ch2, recvBuf); err != nil {
-			t.Fatalf("ReadFull failed: %v", err)
+			t.Fatalf("iter %d ReadFull failed: %v", i, err)
 		}
 
 		extra := make([]byte, 1)
@@ -1150,9 +1150,12 @@ func TestReliable_MaxRetransmit_Timeout(t *testing.T) {
 		t.Fatalf("Write error: %v", err)
 	}
 
-	// Wait for 3 retransmits to expire (3 * 20ms = ~60ms)
-	time.Sleep(200 * time.Millisecond)
-
+	// Retransmissions back off exponentially: 20+40+80+160ms until the 4th
+	// timeout gives up (~300ms plus ticker granularity).
+	deadline := time.Now().Add(2 * time.Second)
+	for !ch1.closed.Load() && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 	if !ch1.closed.Load() {
 		t.Fatal("Channel did not close after exceeding MaxRetransmit")
 	}

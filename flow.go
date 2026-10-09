@@ -46,7 +46,7 @@ func NewStreamFlow(chID uint32, initialWindow int32, ch *Channel, s *Session) *S
 func (sf *StreamFlow) AcquireCredits(desired int32) (int32, error) {
 	for {
 		// Fast exit if channel or session was closed
-		if sf.channel.closed.Load() || sf.session.isClosed() {
+		if sf.channel.closed.Load() || sf.channel.writeClosed.Load() || sf.session.isClosed() {
 			return 0, io.ErrClosedPipe
 		}
 

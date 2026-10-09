@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 )
 
@@ -382,6 +383,18 @@ func (c *datagramConn) setMaxOut(n int) {
 	c.maxOut.Store(int32(n))
 }
 
+// Write sends one datagram. Transient send errors are reported as success:
+// for a datagram transport they are packet loss (ARQ/keepalive deal with
+// it), not a broken connection. Treating them as fatal made every ENOBUFS
+// on a busy raw socket, or a stray ICMP error, tear the transport down.
+func (c *datagramConn) Write(b []byte) (int, error) {
+	n, err := c.Conn.Write(b)
+	if err != nil && isTransientDatagramErr(err) {
+		return len(b), nil
+	}
+	return n, err
+}
+
 func (c *datagramConn) maxDatagramSize() int { return int(c.maxOut.Load()) }
 
 func (c *datagramConn) Read(b []byte) (int, error) {
@@ -400,6 +413,9 @@ func (c *datagramConn) Read(b []byte) (int, error) {
 			n, err = c.Conn.Read(c.buf)
 		}
 		if err != nil {
+			if isTransientDatagramErr(err) {
+				continue // e.g. ICMP unreachable reported on a connected socket
+			}
 			return 0, err
 		}
 		c.r, c.w = 0, n
@@ -407,4 +423,22 @@ func (c *datagramConn) Read(b []byte) (int, error) {
 	n := copy(b, c.buf[c.r:c.w])
 	c.r += n
 	return n, nil
+}
+
+// isTransientDatagramErr reports socket errors that mean "this datagram was
+// lost" rather than "the socket is unusable": queue overflow (ENOBUFS,
+// EAGAIN) and asynchronous ICMP errors that the kernel reports on the next
+// call (ECONNREFUSED, EHOSTUNREACH, ...).
+func isTransientDatagramErr(err error) bool {
+	var errno syscall.Errno
+	if !errors.As(err, &errno) {
+		return false
+	}
+	switch errno {
+	case syscall.ENOBUFS, syscall.EAGAIN, syscall.ECONNREFUSED, syscall.EHOSTUNREACH,
+		syscall.ENETUNREACH, syscall.EHOSTDOWN, syscall.ENETDOWN, syscall.EMSGSIZE,
+		syscall.ENOPROTOOPT: // ICMP protocol unreachable (raw IP)
+		return true
+	}
+	return false
 }
