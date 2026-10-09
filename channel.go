@@ -21,7 +21,7 @@ type Channel struct {
 
 	waitState atomic.Uint32 // stateIdle or stateWaiting (for Read)
 	reading   atomic.Int32
-	readMu    sync.Mutex // Guarantees thread-safe consumer reads on ring buffer
+	readMu    sync.Mutex
 
 	flow *StreamFlow
 
@@ -29,7 +29,7 @@ type Channel struct {
 	closeChan chan struct{} // Closed once to broadcast-unblock all readers & writers
 	drainOnce sync.Once
 	closed    atomic.Bool // Local write/read closed
-	readDone  atomic.Bool // Remote peer closed (FIN received)
+	readDone  atomic.Bool
 
 	// Reliability Engine (ARQ & In-Order Reassembly)
 	writeOffset uint64
@@ -237,7 +237,7 @@ func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
 
 	// 2. Next contiguous in-order slice
 	if offset == c.readOffset {
-		c.Feed(pBuf)
+		c.feed(pBuf)
 		c.readOffset += uint64(length)
 
 		// Drain contiguous backlog
@@ -248,7 +248,7 @@ func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
 					break
 				}
 				delete(c.reorderMap, c.readOffset)
-				c.Feed(nextFrame.pBuf)
+				c.feed(nextFrame.pBuf)
 				c.readOffset += uint64(nextFrame.length)
 			}
 		}
@@ -383,7 +383,7 @@ func (c *Channel) retransmitAllUnacked() {
 	}
 }
 
-func (c *Channel) Feed(buffer *[]byte) error {
+func (c *Channel) feed(buffer *[]byte) error {
 	if c.closed.Load() || c.session.isClosed() {
 		return io.ErrClosedPipe
 	}

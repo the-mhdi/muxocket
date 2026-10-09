@@ -101,7 +101,7 @@ func DefaultConfig() *Config {
 		RetransmitTimeout:         150 * time.Millisecond,
 		MaxRetransmit:             8,
 		AckInterval:               10 * time.Millisecond,
-		AllowConnectionResumption: false,
+		AllowConnectionResumption: true,
 		ConnectionResumeTimeout:   5 * time.Second,
 	}
 }
@@ -292,7 +292,7 @@ func (s *Session) readLoop() {
 				if s.config.Reliability {
 					ch.feedReliable(offset, pNewbuf, DataLength)
 				} else {
-					if err := ch.Feed(pNewbuf); err != nil {
+					if err := ch.feed(pNewbuf); err != nil {
 						defaultAllocator.Put(pNewbuf)
 					}
 				}

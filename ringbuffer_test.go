@@ -912,7 +912,7 @@ func TestIdleShrinkOnRollover(t *testing.T) {
 func TestSPSC_RaceSoak_RecycleGenerations(t *testing.T) {
 	rb := NewBufferRing(16) // Start small to force rapid initial ramp-up
 
-	const totalCycles = 600
+	const totalCycles = 6000
 	var totalItemsPushed uint64
 
 	var wg sync.WaitGroup
