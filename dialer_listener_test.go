@@ -335,7 +335,7 @@ func TestDialer_ServerTamperedSignature(t *testing.T) {
 		// Forge server responder handshake
 		ln := &Listener{sessionConfig: DefaultConfig()}
 		_, serverPriv, _ := ed25519.GenerateKey(rand.Reader)
-		res, _ := ln.buildResponderHandshake("12345678901234567890123456789012", 0, serverPriv)
+		res, _ := ln.buildResponderHandshake("12345678901234567890123456789012", 0, serverPriv, buf)
 
 		// Corrupt signature byte
 		res[len(res)-1] ^= 0xEE

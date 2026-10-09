@@ -225,8 +225,10 @@ func initiatorExchange(conn net.Conn, timeout time.Duration, sid [32]byte, nonce
 		return nil, ErrMalformedHandshake
 	}
 
+	// The signature must cover our exact request (incl. its fresh random), so
+	// a response captured from an earlier handshake fails here.
 	signedPortion := respBuf[:54+int(resp.publicKeyLen)]
-	if !ed25519.Verify(resp.PublicKey, signedPortion, resp.Signature) {
+	if !ed25519.Verify(resp.PublicKey, responderSignedMessage(signedPortion, req[2:]), resp.Signature) {
 		return nil, ErrInvalidSignature
 	}
 	if nonce != 0 && resp.Nonce != nonce {

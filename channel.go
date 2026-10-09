@@ -40,6 +40,7 @@ type Channel struct {
 	reorderMap  map[uint64]*reorderFrame
 	finOffset   uint64
 	hasFin      bool
+	inARQ       bool // registered in session.arqSet; guarded by unackedMu
 
 	// Coalesced ACK state (see sendAck / writeLoop)
 	ackOffset  atomic.Uint64
@@ -67,7 +68,7 @@ func newChannel(id uint32, session *Session) *Channel {
 	ch.flow = NewStreamFlow(id, int32(session.config.InitialStreamWindow), ch, session)
 
 	if session.config.Reliability {
-		go ch.arqLoop()
+		session.ensureARQ()
 	}
 
 	return ch
@@ -125,6 +126,10 @@ func (c *Channel) Write(b []byte) (int, error) {
 			frame.ack = uf
 			c.unackedMu.Lock()
 			c.unacked = append(c.unacked, uf)
+			if !c.inARQ {
+				c.inARQ = true
+				c.session.arqAdd(c)
+			}
 			c.unackedMu.Unlock()
 		}
 
@@ -359,29 +364,6 @@ func (c *Channel) onAck(ackOffset uint64) {
 	}
 }
 
-func (c *Channel) arqLoop() {
-	rto := c.session.config.RetransmitTimeout
-	ticker := time.NewTicker(rto / 2)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-c.session.die:
-			return
-		case <-ticker.C:
-			if c.closed.Load() {
-				c.unackedMu.Lock()
-				empty := len(c.unacked) == 0
-				c.unackedMu.Unlock()
-				if empty {
-					return
-				}
-			}
-			c.checkRetransmissions(rto)
-		}
-	}
-}
-
 // checkRetransmissions collects due frames under the lock but sends them
 // after releasing it. The old version called the blocking writeDataFrame while
 // holding unackedMu; when the write queue was full, onAck (called from
@@ -541,6 +523,10 @@ func (c *Channel) cleanupReliability() {
 	c.unackedMu.Lock()
 	unacked := c.unacked
 	c.unacked = nil
+	if c.inARQ {
+		c.inARQ = false
+		c.session.arqRemove(c)
+	}
 	c.unackedMu.Unlock()
 	for _, f := range unacked {
 		f.release() // frames still queued in the writer keep their own ref

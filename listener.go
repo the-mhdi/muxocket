@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -34,7 +35,9 @@ var (
 )
 
 const (
-	PROTOCOL_VERSION uint8 = 1
+	// v2: the responder signature covers a hash of the initiator's request
+	// (transcript binding). v1 peers would accept replayed responses.
+	PROTOCOL_VERSION uint8 = 2
 
 	// Minimum sizes
 	MinInitiatorHandshakeLen = 165
@@ -306,7 +309,7 @@ func (ln *Listener) handshake(conn net.Conn) (*activeSession, bool, error) {
 			}
 		}
 
-		res, err := ln.buildResponderHandshake(session.id, parsedMsg.Nonce, session.responderPrivateKey)
+		res, err := ln.buildResponderHandshake(session.id, parsedMsg.Nonce, session.responderPrivateKey, buf[:length])
 		if err != nil {
 			return nil, false, err
 		}
@@ -340,7 +343,7 @@ func (ln *Listener) handshake(conn net.Conn) (*activeSession, bool, error) {
 		return nil, false, err
 	}
 
-	res, err := ln.buildResponderHandshake(sid, 0, priv)
+	res, err := ln.buildResponderHandshake(sid, 0, priv, buf[:length])
 	if err != nil {
 		return nil, false, err
 	}
@@ -375,6 +378,7 @@ func (ln *Listener) buildResponderHandshake(
 	sid string,
 	nonce uint16,
 	priv ed25519.PrivateKey,
+	initiatorPayload []byte, // the exact request bytes (without length prefix) being answered
 ) ([]byte, error) {
 	cfg := ln.sessionConfig
 	if cfg == nil {
@@ -406,7 +410,7 @@ func (ln *Listener) buildResponderHandshake(
 	payload[53] = byte(len(pub))
 	copy(payload[54:86], pub)
 
-	sig := ed25519.Sign(priv, payload[:signedLen])
+	sig := ed25519.Sign(priv, responderSignedMessage(payload[:signedLen], initiatorPayload))
 	payload[signedLen] = byte(len(sig))
 	copy(payload[signedLen+1:], sig)
 
@@ -416,6 +420,22 @@ func (ln *Listener) buildResponderHandshake(
 
 	return packet, nil
 }
+
+// responderSignedMessage is what the responder signs: its own handshake
+// fields followed by a domain-separated SHA-256 of the initiator's request.
+// The request contains a fresh 32-byte random value, so a recorded response
+// verifies only against the request it originally answered and can't be
+// replayed to another (or a later) client handshake. Wire format is unchanged.
+func responderSignedMessage(responderFields, initiatorPayload []byte) []byte {
+	h := sha256.New()
+	h.Write([]byte(transcriptLabel))
+	h.Write(initiatorPayload)
+	msg := make([]byte, 0, len(responderFields)+sha256.Size)
+	msg = append(msg, responderFields...)
+	return h.Sum(msg)
+}
+
+const transcriptLabel = "muxocket/v2 responder transcript\x00"
 
 func (ln *Listener) resumeSession(session *activeSession, conn io.ReadWriteCloser) {
 	session.session.alterConnection(conn)

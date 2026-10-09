@@ -179,7 +179,9 @@ func (s *packetSubConn) Read(b []byte) (int, error) {
 
 	totalRead := 0
 
-	// One timer per Read call.
+	// One timer per Read call. The old code created a new timer (and a new
+	// deferred Stop) on every loop iteration, accumulating timers/defers for
+	// as long as a Read stayed blocked.
 	var timerCh <-chan time.Time
 	if dl := s.readDeadline.Load(); dl != nil && !dl.IsZero() {
 		d := time.Until(*dl)

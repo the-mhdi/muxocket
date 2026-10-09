@@ -6,8 +6,10 @@ import (
 	"crypto/rand"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -457,4 +459,76 @@ func TestDialer_HandshakeTimeout(t *testing.T) {
 	if time.Since(start) > 2*time.Second {
 		t.Fatal("handshake timeout not enforced")
 	}
+}
+
+// A responder reply recorded from one handshake must not verify for another
+// handshake: the signature is bound to the initiator's request (and its
+// fresh random value).
+func TestDialer_ReplayedServerResponse_Rejected(t *testing.T) {
+	ln := &Listener{
+		sessionConfig:             DefaultConfig(),
+		handshakeTimeout:          time.Second,
+		AllowConnectionResumption: true,
+		sessions:                  make(map[string]*activeSession),
+	}
+
+	// 1. Record a genuine server response to some earlier client request.
+	_, oldPriv, _ := ed25519.GenerateKey(rand.Reader)
+	oldReq, _ := BuildInitiatorHandshake([32]byte{}, 0, oldPriv)
+	_, serverPriv, _ := ed25519.GenerateKey(rand.Reader)
+	recorded, err := ln.buildResponderHandshake("12345678901234567890123456789012", 0, serverPriv, oldReq[2:])
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Sanity: it does verify for the request it answered.
+	cOK, sOK := net.Pipe()
+	defer cOK.Close()
+	defer sOK.Close()
+	go func() {
+		var l [2]byte
+		io.ReadFull(sOK, l[:])
+		io.ReadFull(sOK, make([]byte, binary.BigEndian.Uint16(l[:])))
+		sOK.Write(recorded)
+	}()
+	// Different request (new random) -> must fail even with the same key.
+	if _, err := initiatorExchange(cOK, time.Second, [32]byte{}, 0, oldPriv); !errors.Is(err, ErrInvalidSignature) {
+		t.Fatalf("replayed response accepted for a new request, err=%v", err)
+	}
+}
+
+// Many idle reliable channels must not cost one goroutine each.
+func TestReliable_SharedARQTimer_NoGoroutinePerChannel(t *testing.T) {
+	s1, s2 := createReliableSessionPair(t)
+	defer s1.Close()
+	defer s2.Close()
+
+	before := runtime.NumGoroutine()
+	for i := 0; i < 500; i++ {
+		if _, err := s1.OpenChannel(fmt.Sprintf("a%d", i)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if d := runtime.NumGoroutine() - before; d > 5 {
+		t.Fatalf("opening 500 reliable channels added %d goroutines", d)
+	}
+
+	// Channels leave the ARQ set once everything is acknowledged.
+	c1, _ := s1.OpenChannel("arq")
+	c2, _ := s2.OpenChannel("arq")
+	if _, err := c1.Write([]byte("hello")); err != nil {
+		t.Fatal(err)
+	}
+	io.ReadFull(c2, make([]byte, 5))
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		s1.arqMu.Lock()
+		n := len(s1.arqSet)
+		s1.arqMu.Unlock()
+		if n == 0 {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("acknowledged channel was never removed from the ARQ set")
 }

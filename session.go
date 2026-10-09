@@ -70,6 +70,13 @@ type Session struct {
 
 	hooksMu    sync.Mutex
 	closeHooks []func()
+
+	// Shared ARQ timer: one goroutine/ticker per session scans only the
+	// channels that currently have unacknowledged data. Replaces one
+	// goroutine + ticker per reliable channel.
+	arqOnce sync.Once
+	arqMu   sync.Mutex
+	arqSet  map[*Channel]struct{}
 }
 
 type PacketFrame struct {
@@ -104,7 +111,9 @@ type Config struct {
 
 func DefaultConfig() *Config {
 	return &Config{
-
+		// NOTE: this used to be DEFAULT_MAX_FRAME_LEN (32 KiB + 17). The allocator
+		// rounds up to the next power of two, so every full-size frame was
+		// backed by a 64 KiB slab: ~2x memory for every in-flight/buffered frame.
 		MaxFrameDataSize:          DEFAULT_MAX_FRAME_DATA_LEN,
 		MaxWriteBufferSize:        32,
 		InitialStreamWindow:       DefaultInitialStreamWindow,
@@ -199,6 +208,80 @@ func (s *Session) OpenChannel(label string) (*Channel, error) {
 	ch := newChannel(id, s)
 	s.channels[id] = ch
 	return ch, nil
+}
+
+func (s *Session) ensureARQ() {
+	s.arqOnce.Do(func() {
+		s.arqMu.Lock()
+		if s.arqSet == nil {
+			s.arqSet = make(map[*Channel]struct{})
+		}
+		s.arqMu.Unlock()
+		go s.arqLoop()
+	})
+}
+
+// arqAdd / arqRemove are called with ch.unackedMu held (lock order:
+// unackedMu -> arqMu), which makes the empty-check-then-remove in arqLoop
+// atomic with respect to Write registering new frames.
+func (s *Session) arqAdd(ch *Channel) {
+	s.arqMu.Lock()
+	if s.arqSet == nil {
+		s.arqSet = make(map[*Channel]struct{})
+	}
+	s.arqSet[ch] = struct{}{}
+	s.arqMu.Unlock()
+}
+
+func (s *Session) arqRemove(ch *Channel) {
+	s.arqMu.Lock()
+	delete(s.arqSet, ch)
+	s.arqMu.Unlock()
+}
+
+func (s *Session) arqLoop() {
+	rto := s.config.RetransmitTimeout
+	tick := rto / 2
+	if tick < time.Millisecond {
+		tick = time.Millisecond
+	}
+	ticker := time.NewTicker(tick)
+	defer ticker.Stop()
+
+	var batch []*Channel // reused across ticks
+	for {
+		select {
+		case <-s.die:
+			return
+		case <-ticker.C:
+		}
+		// While suspended there is no transport: retransmitting would only
+		// burn MaxRetransmit attempts and close healthy channels. Resumption
+		// retransmits everything anyway.
+		if s.suspended.Load() {
+			continue
+		}
+
+		batch = batch[:0]
+		s.arqMu.Lock()
+		for ch := range s.arqSet {
+			batch = append(batch, ch)
+		}
+		s.arqMu.Unlock()
+
+		for i, ch := range batch {
+			ch.unackedMu.Lock()
+			if len(ch.unacked) == 0 {
+				ch.inARQ = false
+				s.arqRemove(ch)
+				ch.unackedMu.Unlock()
+			} else {
+				ch.unackedMu.Unlock()
+				ch.checkRetransmissions(rto)
+			}
+			batch[i] = nil
+		}
+	}
 }
 
 func (s *Session) getChannel(id uint32) *Channel {
