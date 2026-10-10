@@ -95,6 +95,24 @@ func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Liste
 	return ln, nil
 }
 
+func (ln *Listener) handleIncomingPacketConn(subConn *packetSubConn) {
+	activeSess, isResumed, err := ln.handshake(subConn)
+	if err != nil {
+		_ = subConn.Close()
+		return
+	}
+
+	if isResumed && ln.TransparentResumption {
+		return
+	}
+
+	select {
+	case <-ln.die:
+		_ = subConn.Close()
+	case ln.acceptChan <- activeSess.session:
+	}
+}
+
 // packetReadLoop reads incoming UDP datagrams and routes them to per-client subConns
 func (ln *Listener) packetReadLoop(MTU int) {
 	// Raw IPv4 sockets read the IP header (up to 60 bytes) into the buffer

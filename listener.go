@@ -214,24 +214,6 @@ func (ln *Listener) handleIncomingStreamConn(conn net.Conn) {
 	}
 }
 
-func (ln *Listener) handleIncomingPacketConn(subConn *packetSubConn) {
-	activeSess, isResumed, err := ln.handshake(subConn)
-	if err != nil {
-		_ = subConn.Close()
-		return
-	}
-
-	if isResumed && ln.TransparentResumption {
-		return
-	}
-
-	select {
-	case <-ln.die:
-		_ = subConn.Close()
-	case ln.acceptChan <- activeSess.session:
-	}
-}
-
 func (ln *Listener) handshake(conn net.Conn) (*activeSession, bool, error) {
 	_ = conn.SetDeadline(time.Now().Add(ln.handshakeTimeout))
 	defer func() { _ = conn.SetDeadline(time.Time{}) }()
