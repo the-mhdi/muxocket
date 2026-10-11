@@ -87,8 +87,20 @@ type Session struct {
 	// channelsMu). The protocol has no channel-open frame, so the peer may
 	// legitimately send before our OpenChannel; these are delivered when the
 	// channel is opened instead of being dropped.
-	pending      map[uint32][]pendingFrame
+	pending      map[uint32]*pendingQueue
 	pendingBytes int
+
+	// closedIDs holds recently closed channel IDs (guarded by channelsMu,
+	// Reliability only). Late retransmits for a closed channel are dropped
+	// instead of stashed, so they can't leak into a later channel with the
+	// same label. Cleared for an ID when OpenChannel is called for it again.
+	closedIDs map[uint32]time.Time
+}
+
+type pendingQueue struct {
+	frames  []pendingFrame
+	bytes   int
+	expires time.Time
 }
 
 type pendingFrame struct {
@@ -101,22 +113,104 @@ type pendingFrame struct {
 const (
 	maxPendingBytes    = (4 * DEFAULT_MAX_FRAME_LEN) // per session
 	maxPendingChannels = 16
+	// pendingTTL bounds how long early frames wait for a local OpenChannel.
+	pendingTTL = 5 * time.Second
+	// closedLinger is how long late frames for a closed channel are dropped.
+	closedLinger = 5 * time.Second
+	maxClosedIDs = 32
 )
+
+// releasePendingLocked frees a stashed queue's buffers and returns their
+// flow-control credit (channelsMu held).
+func (s *Session) releasePendingLocked(id uint32, q *pendingQueue) {
+	for _, f := range q.frames {
+		if f.pBuf != nil {
+			_ = defaultAllocator.Put(f.pBuf)
+		}
+		s.creditDiscarded(f.length)
+	}
+	s.pendingBytes -= q.bytes
+	delete(s.pending, id)
+}
+
+// pruneLocked drops expired stash queues and closed-ID markers (channelsMu held).
+func (s *Session) pruneLocked(now time.Time) {
+	for id, q := range s.pending {
+		if now.After(q.expires) {
+			s.releasePendingLocked(id, q)
+		}
+	}
+	for id, t := range s.closedIDs {
+		if now.After(t) {
+			delete(s.closedIDs, id)
+		}
+	}
+}
+
+// markClosedLocked records id as recently closed and discards anything
+// stashed for it (channelsMu held).
+func (s *Session) markClosedLocked(id uint32) {
+	if q := s.pending[id]; q != nil {
+		s.releasePendingLocked(id, q)
+	}
+	// Only reliable sessions get stragglers after both FINs (ARQ
+	// retransmits), and only there is dropping lossless: the peer resends
+	// anything a quick legitimate re-open loses. Without Reliability on an
+	// ordered transport the FIN is the channel's last frame, so nothing can
+	// arrive late, and dropping would lose real data from a re-open.
+	if !s.config.Reliability {
+		return
+	}
+	if s.closedIDs == nil {
+		s.closedIDs = make(map[uint32]time.Time)
+	}
+	now := time.Now()
+	if len(s.closedIDs) >= maxClosedIDs {
+		s.pruneLocked(now)
+		if len(s.closedIDs) >= maxClosedIDs {
+			return // best effort: fall back to the old behaviour
+		}
+	}
+	s.closedIDs[id] = now.Add(closedLinger)
+}
+
+// recentlyClosedLocked reports whether id was closed within closedLinger.
+func (s *Session) recentlyClosedLocked(id uint32) bool {
+	t, ok := s.closedIDs[id]
+	if !ok {
+		return false
+	}
+	if time.Now().After(t) {
+		delete(s.closedIDs, id)
+		return false
+	}
+	return true
+}
 
 // stashLocked keeps an early frame (channelsMu held). Returns false if the
 // limits are exceeded and the frame must be dropped.
 func (s *Session) stashLocked(id uint32, f pendingFrame) bool {
+	if s.recentlyClosedLocked(id) {
+		return false
+	}
 	if s.pending == nil {
-		s.pending = make(map[uint32][]pendingFrame)
+		s.pending = make(map[uint32]*pendingQueue)
 	}
-	q, ok := s.pending[id]
-	if !ok && len(s.pending) >= maxPendingChannels {
+	now := time.Now()
+	s.pruneLocked(now)
+	q := s.pending[id]
+	if q == nil && len(s.pending) >= maxPendingChannels {
 		return false
 	}
-	if s.pendingBytes+int(f.length) > int(maxPendingBytes) || len(q) >= 4096 {
+	if s.pendingBytes+int(f.length) > int(maxPendingBytes) || (q != nil && len(q.frames) >= 4096) {
 		return false
 	}
-	s.pending[id] = append(q, f)
+	if q == nil {
+		q = &pendingQueue{expires: now.Add(pendingTTL)}
+		s.pending[id] = q
+	}
+	q.frames = append(q.frames, f)
+	q.bytes += int(f.length)
 	s.pendingBytes += int(f.length)
 	return true
 }
@@ -282,12 +376,18 @@ func (s *Session) OpenChannel(label string) (*Channel, error) {
 	}
 
 	ch := newChannel(id, s)
-	frames := s.pending[id]
-	if frames != nil {
-		delete(s.pending, id)
-		for _, f := range frames {
-			s.pendingBytes -= int(f.length)
+	delete(s.closedIDs, id)
+	var frames []pendingFrame
+	if q := s.pending[id]; q != nil {
+		if time.Now().After(q.expires) {
+			s.releasePendingLocked(id, q)
+		} else {
+			frames = q.frames
+			s.pendingBytes -= q.bytes
+			delete(s.pending, id)
 		}
+	}
+	if frames != nil {
 		// Hold feedMu before publishing the channel: readLoop will block on it
 		// for any newer frame, so early frames are delivered first, in order.
 		ch.feedMu.Lock()
@@ -387,7 +487,10 @@ func (s *Session) getChannel(id uint32) *Channel {
 
 func (s *Session) removeChannel(id uint32) {
 	s.channelsMu.Lock()
-	delete(s.channels, id)
+	if _, ok := s.channels[id]; ok {
+		delete(s.channels, id)
+		s.markClosedLocked(id)
+	}
 	s.channelsMu.Unlock()
 }
 
@@ -397,6 +500,7 @@ func (s *Session) removeChannelIf(id uint32, ch *Channel) {
 	s.channelsMu.Lock()
 	if s.channels[id] == ch {
 		delete(s.channels, id)
+		s.markClosedLocked(id)
 	}
 	s.channelsMu.Unlock()
 }
@@ -532,12 +636,22 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 			if ch == nil {
 				s.channelsMu.Lock()
 				ch = s.channels[channelID]
-				stashed := false
+				stashed, late := false, false
 				if ch == nil && !s.isClosed() {
-					stashed = s.stashLocked(channelID, pendingFrame{flag: FLG_DATA, offset: offset, pBuf: pNewbuf, length: dataLength})
+					late = s.recentlyClosedLocked(channelID)
+					if !late {
+						stashed = s.stashLocked(channelID, pendingFrame{flag: FLG_DATA, offset: offset, pBuf: pNewbuf, length: dataLength})
+					}
 				}
 				s.channelsMu.Unlock()
 				if stashed {
+					continue
+				}
+				if late {
+					// Normal straggler for a channel we just closed: drop it
+					// without counting it as a protocol error.
+					_ = defaultAllocator.Put(pNewbuf)
+					s.creditDiscarded(dataLength)
 					continue
 				}
 			}
@@ -786,13 +900,14 @@ func (s *Session) Close() error {
 		}
 		s.channels = make(map[uint32]*Channel)
 		for _, q := range s.pending {
-			for _, f := range q {
+			for _, f := range q.frames {
 				if f.pBuf != nil {
 					_ = defaultAllocator.Put(f.pBuf)
 				}
 			}
 		}
 		s.pending = nil
+		s.closedIDs = nil
 		s.pendingBytes = 0
 		s.channelsMu.Unlock()
 
