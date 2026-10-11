@@ -39,6 +39,10 @@ const (
 	FLG_GOAWAY uint8 = 8
 )
 
+const (
+	maxClosedIDs = 64 // maximum number of recently closed channel IDs to remember (Reliability only). it is to prevent a malicious peer from sending a lot of late frames to exhaust memory.
+)
+
 type Session struct {
 	id     string
 	config *Config
@@ -110,9 +114,41 @@ type pendingFrame struct {
 	length uint32
 }
 
-const (
-	maxClosedIDs = 64
-)
+type PacketFrame struct {
+	DataLength uint32
+	Flag       uint8
+	ChID       uint32
+	Offset     uint64
+	Data       []byte
+}
+
+type Config struct {
+	MaxFrameDataSize uint32
+	//MaxChannelDataSize     uint32
+	MaxWriteBufferSize      uint32
+	InitialStreamWindow     uint32
+	InitialSessionWindow    uint32
+	DrainChannelAfterClose  bool
+	KeepAlive               bool
+	KeepAliveInterval       time.Duration
+	KeepAliveTimeout        time.Duration
+	MaxUnknownChannelErrors uint32 //default 128, if a session receives more than this number of unknown channel errors, it will close the session
+	// Reliability Engine (ARQ)
+	Reliability       bool          // Enable ARQ, stream offsets, in-order reassembly, and ACKs
+	RetransmitTimeout time.Duration // Base RTO
+	MaxRetransmit     int           // Max attempts before closing channel
+	AckInterval       time.Duration // Delay ACK window
+
+	// Resumption Configuration
+	AllowConnectionResumption bool
+	ConnectionResumeTimeout   time.Duration
+
+	// Pending channel controls
+	MaxPendingChannels              uint //per session
+	MaxPendingEarlyFramesPerSession int
+	PendingFramesTTL                time.Duration // pendingTTL bounds how long early frames wait for a local OpenChannel.
+	ClosedChannelFrameLingerTTL     time.Duration // closedLinger is how long late frames for a closed channel are dropped.
+}
 
 // releasePendingLocked frees a stashed queue's buffers and returns their
 // flow-control credit (channelsMu held).
@@ -243,42 +279,6 @@ func (s *Session) RemoteAddr() net.Addr {
 		return c.RemoteAddr()
 	}
 	return nil
-}
-
-type PacketFrame struct {
-	DataLength uint32
-	Flag       uint8
-	ChID       uint32
-	Offset     uint64
-	Data       []byte
-}
-
-type Config struct {
-	MaxFrameDataSize uint32
-	//MaxChannelDataSize     uint32
-	MaxWriteBufferSize      uint32
-	InitialStreamWindow     uint32
-	InitialSessionWindow    uint32
-	DrainChannelAfterClose  bool
-	KeepAlive               bool
-	KeepAliveInterval       time.Duration
-	KeepAliveTimeout        time.Duration
-	MaxUnknownChannelErrors uint32 //default 128, if a session receives more than this number of unknown channel errors, it will close the session
-	// Reliability Engine (ARQ)
-	Reliability       bool          // Enable ARQ, stream offsets, in-order reassembly, and ACKs
-	RetransmitTimeout time.Duration // Base RTO
-	MaxRetransmit     int           // Max attempts before closing channel
-	AckInterval       time.Duration // Delay ACK window
-
-	// Resumption Configuration
-	AllowConnectionResumption bool
-	ConnectionResumeTimeout   time.Duration
-
-	// Pending channel controls
-	MaxPendingChannels              uint //per session
-	MaxPendingEarlyFramesPerSession int
-	PendingFramesTTL                time.Duration // pendingTTL bounds how long early frames wait for a local OpenChannel.
-	ClosedChannelFrameLingerTTL     time.Duration // closedLinger is how long late frames for a closed channel are dropped.
 }
 
 func DefaultConfig() *Config {
