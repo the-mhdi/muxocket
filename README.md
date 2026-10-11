@@ -121,6 +121,7 @@ reliability, frames in flight during the drop can be lost.
 
 `Channel` is safe for one reader and one writer at a time.
 ​
+## Examples
 ### Server
 ​
 ```go
