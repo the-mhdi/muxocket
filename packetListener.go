@@ -78,7 +78,7 @@ func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Liste
 	ln := &Listener{
 		pconn:                     packetConn,
 		sessionConfig:             cfg,
-		handshakeTimeout:          5 * time.Second,
+		handshakeTimeout:          10 * time.Second,
 		AllowConnectionResumption: true,
 		ConnectionResumeTimeout:   cfg.ConnectionResumeTimeout,
 		sessions:                  make(map[string]*activeSession),

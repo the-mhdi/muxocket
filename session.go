@@ -99,8 +99,8 @@ type pendingFrame struct {
 }
 
 const (
-	maxPendingBytes    = 1 << 20 // per session
-	maxPendingChannels = 64
+	maxPendingBytes    = (4 * DEFAULT_MAX_FRAME_LEN) // per session
+	maxPendingChannels = 16
 )
 
 // stashLocked keeps an early frame (channelsMu held). Returns false if the
@@ -113,7 +113,7 @@ func (s *Session) stashLocked(id uint32, f pendingFrame) bool {
 	if !ok && len(s.pending) >= maxPendingChannels {
 		return false
 	}
-	if s.pendingBytes+int(f.length) > maxPendingBytes || len(q) >= 4096 {
+	if s.pendingBytes+int(f.length) > int(maxPendingBytes) || len(q) >= 4096 {
 		return false
 	}
 	s.pending[id] = append(q, f)

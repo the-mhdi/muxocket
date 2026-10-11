@@ -52,7 +52,7 @@ type Listener struct {
 
 	sessionConfig *Config
 
-	handshakeTimeout          time.Duration
+	handshakeTimeout          time.Duration //default 10s
 	AllowConnectionResumption bool
 	ConnectionResumeTimeout   time.Duration
 	TransparentResumption     bool // If true, resumed sessions continue in-place without returning to Accept()
@@ -93,7 +93,7 @@ func Listen(listener net.Listener, config *Config) (*Listener, error) {
 	return &Listener{
 		ln:                        listener,
 		sessionConfig:             config,
-		handshakeTimeout:          5 * time.Second,
+		handshakeTimeout:          10 * time.Second,
 		AllowConnectionResumption: true,
 		ConnectionResumeTimeout:   config.ConnectionResumeTimeout,
 		sessions:                  make(map[string]*activeSession),
