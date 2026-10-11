@@ -111,8 +111,8 @@ type pendingFrame struct {
 }
 
 const (
-	maxPendingBytes    = (4 * DEFAULT_MAX_FRAME_LEN) // per session
-	maxPendingChannels = 16
+	maxPendingBytes    = (8 * DEFAULT_MAX_FRAME_LEN) // per session
+	maxPendingChannels = 8
 	// pendingTTL bounds how long early frames wait for a local OpenChannel.
 	pendingTTL = 5 * time.Second
 	// closedLinger is how long late frames for a closed channel are dropped.

@@ -53,10 +53,33 @@ func (f *unackedFrame) end() uint64 {
 
 func (f *unackedFrame) retain() { f.refs.Add(1) }
 
+// unackedPool recycles unackedFrames. Safe because of refs: a frame is put
+// back only when the last holder (unacked queue, writer, retransmission)
+// has released it, and no holder touches it after its own release.
+var unackedPool = sync.Pool{New: func() any { return new(unackedFrame) }}
+
+// newUnackedFrame returns a zeroed frame holding refs references.
+func newUnackedFrame(pBuf *[]byte, offset uint64, length uint32, fin bool, refs int32) *unackedFrame {
+	f := unackedPool.Get().(*unackedFrame)
+	f.pBuf = pBuf
+	f.offset = offset
+	f.length = length
+	f.fin = fin
+	f.retransmits = 0
+	f.sentAt = time.Now()
+	f.refs.Store(refs)
+	return f
+}
+
 func (f *unackedFrame) release() {
-	if f.refs.Add(-1) == 0 && f.pBuf != nil {
+	if f.refs.Add(-1) != 0 {
+		return
+	}
+	if f.pBuf != nil {
 		_ = defaultAllocator.Put(f.pBuf)
 	}
+	*f = unackedFrame{}
+	unackedPool.Put(f)
 }
 
 type reorderFrame struct {
@@ -138,6 +161,10 @@ type batchState struct {
 	hdrs   [maxBatchFrames + 1][17]byte
 	raw    [(maxBatchFrames + 1) * 2][]byte
 	frames [maxBatchFrames + 1]writeFrame
+	// bufs is the net.Buffers value handed to WriteTo. Keeping it in the
+	// (heap-allocated, reused) batchState stops WriteTo's pointer receiver
+	// from forcing a fresh heap allocation on every batch.
+	bufs net.Buffers
 }
 
 // writeBatch encodes and writes frames, then releases their buffers.
@@ -166,8 +193,9 @@ func (ws *writeScheduler) writeBatch(b *batchState, writer io.Writer, n int) err
 				bufSlice = append(bufSlice, (*f.pBuf)[:f.length])
 			}
 		}
-		netBuf := net.Buffers(bufSlice)
-		_, err = netBuf.WriteTo(writer)
+		b.bufs = bufSlice
+		_, err = b.bufs.WriteTo(writer)
+		b.bufs = nil
 		// net.Buffers.WriteTo consumes the slice; clear stale references so
 		// the backing array doesn't pin payload slabs between batches.
 		for i := range b.raw {

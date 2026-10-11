@@ -136,13 +136,7 @@ func (c *Channel) Write(b []byte) (int, error) {
 		// Track in unacked queue prior to transmission if ARQ is active.
 		// refs = 2: one for the unacked queue, one for the writer.
 		if c.session.config.Reliability {
-			uf := &unackedFrame{
-				pBuf:   pBuf,
-				offset: currOffset,
-				length: uint32(sz),
-				sentAt: time.Now(),
-			}
-			uf.refs.Store(2)
+			uf := newUnackedFrame(pBuf, currOffset, uint32(sz), false, 2)
 			frame.ack = uf
 			c.unackedMu.Lock()
 			c.unacked = append(c.unacked, uf)
@@ -395,6 +389,9 @@ func (c *Channel) sendAck(cumulativeOffset uint64) {
 	}
 }
 
+// maxRetainedUnacked caps the unacked backing array kept across drains.
+const maxRetainedUnacked = 1024
+
 // onAck releases acknowledged chunks back to the allocator.
 func (c *Channel) onAck(ackOffset uint64) {
 	c.unackedMu.Lock()
@@ -418,10 +415,20 @@ func (c *Channel) onAck(ackOffset uint64) {
 		}
 	}
 	if idx > 0 {
-		c.unacked = c.unacked[idx:]
-		if len(c.unacked) == 0 {
-			c.unacked = nil // drop the (possibly large) backing array
+		// Shift the remainder down instead of reslicing forward: reslicing
+		// shrinks the capacity, so every few ACKs append had to grow a new
+		// backing array. The queue holds at most window/frame entries, so
+		// the copy is cheap.
+		n := copy(c.unacked, c.unacked[idx:])
+		for i := n; i < len(c.unacked); i++ {
+			c.unacked[i] = nil // don't pin released frames
+		}
+		c.unacked = c.unacked[:n]
+		if n == 0 {
 			drained = true
+			if cap(c.unacked) > maxRetainedUnacked {
+				c.unacked = nil // drop an unusually large backing array
+			}
 		}
 	}
 }
@@ -566,8 +573,7 @@ func (c *Channel) sendFinLocked() {
 		offset: atomic.LoadUint64(&c.writeOffset),
 	}
 	if c.session.config.Reliability {
-		uf := &unackedFrame{offset: frame.offset, sentAt: time.Now(), fin: true}
-		uf.refs.Store(2)
+		uf := newUnackedFrame(nil, frame.offset, 0, true, 2)
 		frame.ack = uf
 		c.unackedMu.Lock()
 		c.unacked = append(c.unacked, uf)
