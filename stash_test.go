@@ -2,6 +2,7 @@ package muxocket
 
 import (
 	"io"
+	"net"
 	"testing"
 	"time"
 )
@@ -98,5 +99,24 @@ func TestReliable_LateFrames_NotDeliveredToReopenedChannel(t *testing.T) {
 	a2.Write([]byte("fresh"))
 	if got := readN(t, b2, 5); got != "fresh" {
 		t.Fatalf("reopened channel got %q, want %q", got, "fresh")
+	}
+}
+
+// A Config literal that leaves the stash fields at zero must still buffer
+// early frames (zero means "use the default", not "disabled").
+func TestSession_Stash_ZeroValueConfigUsesDefaults(t *testing.T) {
+	c1, c2 := net.Pipe()
+	s1 := NewSession(c1, &Config{})
+	s2 := NewSession(c2, &Config{})
+	defer s1.Close()
+	defer s2.Close()
+
+	a, _ := s1.OpenChannel("zero")
+	a.Write([]byte("early"))
+	time.Sleep(50 * time.Millisecond) // arrives before s2 opens the channel
+
+	b, _ := s2.OpenChannel("zero")
+	if got := readN(t, b, 5); got != "early" {
+		t.Fatalf("got %q, want early data delivered", got)
 	}
 }

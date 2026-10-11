@@ -1,17 +1,17 @@
 # muxocket
-​
+
 Go package that multiplexes many bidirectional byte streams ("channels") over
 one connection: TCP, Unix sockets, UDP or any `net.Conn`. It has per-channel
 and per-session flow control, optional reliability (ARQ) for lossy
 transports, keepalive, graceful close and session resumption across
 reconnects or IP changes.
-​
+
 ## Protocol
-​
+
 ### Framing
 Every frame has a fixed 17-byte big-endian header, followed by `length`
 payload bytes for DATA frames only:
-​
+
 ```
  0        4    5        9                 17
  +--------+----+--------+-----------------+----------------+
@@ -19,7 +19,7 @@ payload bytes for DATA frames only:
  |  u32   | u8 |  u32   |      u64        | (DATA only)    |
  +--------+----+--------+-----------------+----------------+
 ```
-​
+
 | flag | name   | meaning |
 |------|--------|---------|
 | 1 | DATA   | `length` payload bytes; `offset` = stream position of the first byte |
@@ -36,12 +36,12 @@ payload bytes for DATA frames only:
   transports, one or more whole frames go in each datagram, which must fit
   the MTU.
 - The writer batches queued frames into a single `writev` call.
-​
+
 ### Handshake
-​
+
 The dialer speaks first. Each message is prefixed by a 2-byte length and
 signed with Ed25519.
-​
+
 1. **Initiator → responder:** protocol version, session ID (zero for a new
    session), nonce (0 for a new session), 32 random bytes, the initiator's
    public key and a signature.
@@ -51,10 +51,10 @@ signed with Ed25519.
    responder's public key, and a signature over these fields plus a hash of
    the initiator's request. That binding means a recorded response can't be
    replayed against a different handshake.
-​
+
 The **listener decides** window sizes, frame size and reliability; the
 dialer adopts them. Resumption is used only if both sides allow it.
-​
+
 **Resumption:** if the transport drops, the session stays suspended for
 `ConnectionResumeTimeout`. The dialer reconnects and sends a new handshake
 with the existing session ID and a nonce higher than the last one,
@@ -62,15 +62,15 @@ signed with the same key. The listener checks the key and nonce, the dialer
 checks the responder's key is unchanged, and the session carries on over
 the new connection. Channels and stream offsets survive. Without
 reliability, frames in flight during the drop can be lost.
-​
+
 > **Security note:** the handshake detects tampering and prevents replays
 > and session hijacking, but keys are generated per session and **traffic is
 > not encrypted**. Unless you pin keys yourself, this doesn't authenticate
 > who the peer is. Run it over TLS, WireGuard or similar when you need
 > confidentiality or peer identity.
-​
+
 ### Channels
-​
+
 - A channel is identified by a **label** of 1–6 characters `[A-Za-z0-9]`,
   case-insensitive. It's encoded into the 32-bit `chID` (ID 0 is reserved
   for session-level frames).
@@ -81,7 +81,7 @@ reliability, frames in flight during the drop can be lost.
     "channel with this label and ID already exists";
   - `Channel.Label()` is decoded from the ID, so it always returns lowercase
     (`"web"`), whatever spelling was passed to `OpenChannel`.
-​
+
   This is a size limit, not an oversight. With 36 symbols, every label of
   up to 6 characters fits in 32 bits (about 2.24 billion IDs). With 62
   case-sensitive symbols, 6-character labels would need about 57.7 billion.
@@ -101,9 +101,9 @@ reliability, frames in flight during the drop can be lost.
   cumulative ACKs, retransmission with exponential backoff, and in-order
   reassembly. Use it on UDP or other lossy transports. TCP doesn't need it,
   except to keep unacknowledged data across a resumption.
-​
+
 ## API
-​
+
 | | |
 |---|---|
 | `Listen(ln net.Listener, cfg *Config) (*Listener, error)` | stream listener (TCP, Unix) |
@@ -120,10 +120,10 @@ reliability, frames in flight during the drop can be lost.
 | `DefaultConfig() *Config` | |
 
 `Channel` is safe for one reader and one writer at a time.
-​
+
 ## Examples
 ### Server
-​
+
 ```go
 tcpLn, err := net.Listen("tcp", ":9000")
 if err != nil {
@@ -134,7 +134,7 @@ if err != nil {
 	log.Fatal(err)
 }
 defer ln.Close()
-​
+
 for {
 	sess, err := ln.Accept()
 	if err != nil {
@@ -152,9 +152,9 @@ for {
 	}(sess)
 }
 ```
-​
+
 ### Client
-​
+
 ```go
 conn, err := net.Dial("tcp", "server:9000")
 if err != nil {
@@ -165,7 +165,7 @@ if err != nil {
 	log.Fatal(err)
 }
 defer sess.Close()
-​
+
 ch, err := sess.OpenChannel("echo")
 if err != nil {
 	log.Fatal(err)
@@ -175,13 +175,13 @@ ch.CloseWrite()                // FIN: the server's io.Copy ends
 reply, _ := io.ReadAll(ch)     // "hello", then EOF
 fmt.Println(string(reply))
 ```
-​
+
 ### Tunnel / proxy pattern
-​
+
 `io.Copy` uses `ReadFrom` and `WriteTo` automatically, so data moves between
 a TCP connection and a channel without an extra copy through `io.Copy`'s
 buffer:
-​
+
 ```go
 func pipe(ch *muxocket.Channel, c net.Conn) {
 	go func() {
@@ -193,16 +193,16 @@ func pipe(ch *muxocket.Channel, c net.Conn) {
 	ch.Close()
 }
 ```
-​
+
 ### UDP with reliability and automatic resumption
-​
+
 ```go
 // server
 pc, _ := net.ListenPacket("udp", ":9000")
 cfg := muxocket.DefaultConfig()
 cfg.Reliability = true // the listener decides; clients adopt it
 ln, _ := muxocket.ListenPacket(pc, 1400, cfg)
-​
+
 // client
 d := &muxocket.Dialer{
 	Redial: func() (net.Conn, error) { return net.Dial("udp", "server:9000") },
@@ -210,11 +210,11 @@ d := &muxocket.Dialer{
 conn, _ := net.Dial("udp", "server:9000")
 sess, _ := d.Dial(conn) // on a transport failure the session redials and resumes
 ```
-​
+
 ## Configuration
-​
+
 `DefaultConfig()` values:
-​
+
 | field | default | notes |
 |---|---|---|
 | `MaxFrameDataSize` | 32 KiB | max payload per frame (listener decides) |
@@ -225,7 +225,7 @@ sess, _ := d.Dial(conn) // on a transport failure the session redials and resume
 | `Reliability` | off | ARQ (listener decides) |
 | `RetransmitTimeout`, `MaxRetransmit`, `AckInterval` | 150 ms, 8, 10 ms | ARQ tuning; backoff is exponential (capped at 64× RTO) |
 | `AllowConnectionResumption`, `ConnectionResumeTimeout` | on, 5 s | how long a dropped session waits to be resumed |
-| `MaxPendingChannels` | 32 | how many unopened channels go into pending pool before connection get droped |
-| `MaxPendingEarlyFramesPerSession` | 16 | how much data by unopened channels into pending pool before connection get droped |
-| `PendingFramesTTL` | 5 s | bounds how long early frames(data by unopened channels into pending pool) wait for a local OpenChannel |
-| `ClosedChannelFrameLingerTTL` | 5 s | how long late frames for a closed channel are dropped |
+| `MaxPendingChannels` | 32 | max channels with buffered early data (data for a label not opened locally yet); beyond this, frames are dropped |
+| `MaxPendingEarlyFramesPerSession` | 16 | early-data budget per session, in full frames (16 × `MaxFrameDataSize` = 512 KiB by default); beyond this, frames are dropped |
+| `PendingFramesTTL` | 5 s | how long early data waits for a local `OpenChannel` before it's discarded |
+| `ClosedChannelFrameLingerTTL` | 5 s | reliability only: how long late retransmits for a closed channel are dropped instead of buffered |

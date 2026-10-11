@@ -146,8 +146,8 @@ type Config struct {
 	// Pending channel controls
 	MaxPendingChannels              uint //per session
 	MaxPendingEarlyFramesPerSession int
-	PendingFramesTTL                time.Duration // pendingTTL bounds how long early frames wait for a local OpenChannel.
-	ClosedChannelFrameLingerTTL     time.Duration // closedLinger is how long late frames for a closed channel are dropped.
+	PendingFramesTTL                time.Duration // how long early frames wait for a local OpenChannel.
+	ClosedChannelFrameLingerTTL     time.Duration // how long late frames for a closed channel are dropped.
 }
 
 // releasePendingLocked frees a stashed queue's buffers and returns their
@@ -344,6 +344,22 @@ func NewSessionWithID(conn io.ReadWriteCloser, cfg *Config, id string) *Session 
 	}
 	if cfg.MaxUnknownChannelErrors == 0 {
 		cfg.MaxUnknownChannelErrors = 128
+	}
+	// Zero values (e.g. a Config literal that doesn't set these fields) would
+	// otherwise disable the early-frame stash entirely: every frame sent
+	// before the local OpenChannel would be dropped and counted as an
+	// unknown-channel error.
+	if cfg.MaxPendingChannels == 0 {
+		cfg.MaxPendingChannels = 32
+	}
+	if cfg.MaxPendingEarlyFramesPerSession == 0 {
+		cfg.MaxPendingEarlyFramesPerSession = 16
+	}
+	if cfg.PendingFramesTTL == 0 {
+		cfg.PendingFramesTTL = 5 * time.Second
+	}
+	if cfg.ClosedChannelFrameLingerTTL == 0 {
+		cfg.ClosedChannelFrameLingerTTL = 5 * time.Second
 	}
 
 	s := &Session{
