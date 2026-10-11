@@ -6,14 +6,9 @@ and per-session flow control, optional reliability (ARQ) for lossy
 transports, keepalive, graceful close and session resumption across
 reconnects or IP changes.
 ​
-```
-go get github.com/the-mhdi/muxocket
-```
-​
 ## Protocol
 ​
 ### Framing
-​
 Every frame has a fixed 17-byte big-endian header, followed by `length`
 payload bytes for DATA frames only:
 ​
@@ -35,7 +30,6 @@ payload bytes for DATA frames only:
 | 6 | UPD    | window update: grant `length` bytes of credit (`chID` 0 = session window) |
 | 7 | ACK    | reliability only: cumulative ACK, everything below `offset` received |
 | 8 | GOAWAY | last frame of a graceful close; peer closes immediately instead of waiting to resume |
-​
 - Payloads are at most `MaxFrameDataSize` (default 32 KiB). Larger writes are
   split into several frames.
 - On stream transports, frames are written back-to-back. On datagram
@@ -124,7 +118,7 @@ reliability, frames in flight during the drop can be lost.
 | `*Channel`: `ReadFrom`, `WriteTo` | used by `io.Copy` to avoid extra copies |
 | `NewSession(conn io.ReadWriteCloser, cfg *Config) *Session` | raw session with no handshake (tests, custom transports) |
 | `DefaultConfig() *Config` | |
-​
+
 `Channel` is safe for one reader and one writer at a time.
 ​
 ### Server
@@ -230,4 +224,7 @@ sess, _ := d.Dial(conn) // on a transport failure the session redials and resume
 | `Reliability` | off | ARQ (listener decides) |
 | `RetransmitTimeout`, `MaxRetransmit`, `AckInterval` | 150 ms, 8, 10 ms | ARQ tuning; backoff is exponential (capped at 64× RTO) |
 | `AllowConnectionResumption`, `ConnectionResumeTimeout` | on, 5 s | how long a dropped session waits to be resumed |
-​
+| `MaxPendingChannels` | 32 | how many unopened channels go into pending pool before connection get droped |
+| `MaxPendingEarlyFramesPerSession` | 16 | how much data by unopened channels into pending pool before connection get droped |
+| `PendingFramesTTL` | 5 s | bounds how long early frames(data by unopened channels into pending pool) wait for a local OpenChannel |
+| `ClosedChannelFrameLingerTTL` | 5 s | how long late frames for a closed channel are dropped |
