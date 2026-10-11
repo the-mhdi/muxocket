@@ -119,41 +119,9 @@ func (c *Channel) Write(b []byte) (int, error) {
 			return totalSent, err
 		}
 
-		chunk := b[:sz]
 		pBuf := defaultAllocator.Get(int(sz))
-		copy(*pBuf, chunk)
-
-		currOffset := atomic.AddUint64(&c.writeOffset, uint64(sz)) - uint64(sz)
-
-		frame := writeFrame{
-			flag:   FLG_DATA,
-			chID:   c.id,
-			pBuf:   pBuf,
-			length: uint32(sz),
-			offset: currOffset,
-		}
-
-		// Track in unacked queue prior to transmission if ARQ is active.
-		// refs = 2: one for the unacked queue, one for the writer.
-		if c.session.config.Reliability {
-			uf := newUnackedFrame(pBuf, currOffset, uint32(sz), false, 2)
-			frame.ack = uf
-			c.unackedMu.Lock()
-			c.unacked = append(c.unacked, uf)
-			if !c.inARQ {
-				c.inARQ = true
-				c.session.arqAdd(c)
-			}
-			c.unackedMu.Unlock()
-		}
-
-		if err := c.session.writeDataFrame(frame); err != nil {
-			if frame.ack != nil {
-				frame.ack.release() // writer's reference; unacked keeps its own
-			} else {
-				_ = defaultAllocator.Put(pBuf)
-			}
-			c.flow.Refund(sz)
+		copy(*pBuf, b[:sz])
+		if err := c.queueDataLocked(pBuf, sz); err != nil {
 			return totalSent, err
 		}
 
@@ -162,6 +130,47 @@ func (c *Channel) Write(b []byte) (int, error) {
 	}
 
 	return totalSent, nil
+}
+
+// queueDataLocked queues one DATA frame whose payload is *pBuf[:sz] and whose
+// sz bytes of send credit the caller already holds. It takes ownership of
+// pBuf; on error the buffer is released and the credit refunded.
+// Caller holds writeMu.
+func (c *Channel) queueDataLocked(pBuf *[]byte, sz int32) error {
+	currOffset := atomic.AddUint64(&c.writeOffset, uint64(sz)) - uint64(sz)
+
+	frame := writeFrame{
+		flag:   FLG_DATA,
+		chID:   c.id,
+		pBuf:   pBuf,
+		length: uint32(sz),
+		offset: currOffset,
+	}
+
+	// Track in unacked queue prior to transmission if ARQ is active.
+	// refs = 2: one for the unacked queue, one for the writer.
+	if c.session.config.Reliability {
+		uf := newUnackedFrame(pBuf, currOffset, uint32(sz), false, 2)
+		frame.ack = uf
+		c.unackedMu.Lock()
+		c.unacked = append(c.unacked, uf)
+		if !c.inARQ {
+			c.inARQ = true
+			c.session.arqAdd(c)
+		}
+		c.unackedMu.Unlock()
+	}
+
+	if err := c.session.writeDataFrame(frame); err != nil {
+		if frame.ack != nil {
+			frame.ack.release() // writer's reference; unacked keeps its own
+		} else {
+			_ = defaultAllocator.Put(pBuf)
+		}
+		c.flow.Refund(sz)
+		return err
+	}
+	return nil
 }
 
 func (c *Channel) Read(b []byte) (int, error) {
@@ -267,6 +276,198 @@ func (c *Channel) Read(b []byte) (int, error) {
 		case <-c.notify:
 		case <-c.closeChan:
 			return 0, io.ErrClosedPipe
+		}
+		c.waitState.Store(stateIdle)
+	}
+}
+
+// Channel implements io.ReaderFrom and io.WriterTo so that io.Copy moves
+// data between a channel and another connection without the intermediate
+// copy io.Copy would otherwise make through its own 32 KB buffer:
+//
+//	io.Copy(ch, conn) -> ch.ReadFrom(conn): conn is read straight into the
+//	                     pooled buffer that becomes the outgoing frame.
+//	io.Copy(conn, ch) -> ch.WriteTo(conn): received frame buffers are written
+//	                     straight to conn and then recycled.
+//
+// For *net.TCPConn sources, io.Copy first calls conn.WriteTo(ch); Go's
+// fallback for that (no splice possible) ends up in ch.ReadFrom as well.
+var (
+	_ io.ReaderFrom = (*Channel)(nil)
+	_ io.WriterTo   = (*Channel)(nil)
+)
+
+// ReadFrom reads from r until EOF or an error and sends the data on the
+// channel. Each successful r.Read becomes (at least) one frame; the read is
+// done before acquiring send credit, so a ReadFrom blocked on an idle r never
+// holds window that other channels could use. A nil error means r reached
+// EOF; the write side is not closed (call CloseWrite for that).
+func (c *Channel) ReadFrom(r io.Reader) (int64, error) {
+	if c.closed.Load() || c.writeClosed.Load() || c.session.isClosed() {
+		return 0, io.ErrClosedPipe
+	}
+	maxChunk := int(c.session.config.MaxFrameDataSize)
+	var total int64
+	var spare *[]byte // read buffer kept when its contents were copied out
+	defer func() {
+		if spare != nil {
+			_ = defaultAllocator.Put(spare)
+		}
+	}()
+
+	for {
+		pBuf := spare
+		spare = nil
+		if pBuf == nil {
+			pBuf = defaultAllocator.Get(maxChunk)
+		} else {
+			*pBuf = (*pBuf)[:maxChunk]
+		}
+
+		n, rerr := r.Read(*pBuf)
+		if n > 0 {
+			sent, keep, err := c.sendFromRead(pBuf, n)
+			total += int64(sent)
+			if keep {
+				spare = pBuf
+			}
+			if err != nil {
+				return total, err
+			}
+		} else {
+			spare = pBuf
+		}
+
+		if rerr == io.EOF {
+			return total, nil
+		}
+		if rerr != nil {
+			return total, rerr
+		}
+	}
+}
+
+// sendFromRead sends (*pBuf)[:n]. Normally the buffer itself becomes the
+// frame payload (no copy). It is copied instead when the send window only
+// allows part of it, or, with Reliability, when the read was small: an ARQ
+// frame keeps its buffer until acknowledged, and pinning a full-frame slab for
+// every tiny read would multiply memory use far beyond the window.
+// keep reports whether the caller still owns pBuf.
+func (c *Channel) sendFromRead(pBuf *[]byte, n int) (sent int, keep bool, err error) {
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	if c.closed.Load() || c.writeClosed.Load() {
+		return 0, true, io.ErrClosedPipe
+	}
+
+	maxChunk := int(c.session.config.MaxFrameDataSize)
+	copySmall := c.session.config.Reliability && n <= maxChunk/2
+	data := (*pBuf)[:n]
+	keep = true
+
+	for sent < n {
+		sz, err := c.flow.AcquireCredits(int32(n - sent))
+		if err != nil {
+			return sent, keep, err
+		}
+		var fb *[]byte
+		if sent == 0 && int(sz) == n && !copySmall {
+			*pBuf = data
+			fb, keep = pBuf, false
+		} else {
+			fb = defaultAllocator.Get(int(sz))
+			copy(*fb, data[sent:sent+int(sz)])
+		}
+		if err := c.queueDataLocked(fb, sz); err != nil {
+			return sent, keep, err
+		}
+		sent += int(sz)
+	}
+	return sent, keep, nil
+}
+
+// WriteTo writes everything the peer sends to w, until the peer closes its
+// write side (returns nil) or an error occurs. Received frame buffers are
+// passed to w directly; flow-control credit is returned only after w has
+// accepted the bytes, so a slow w slows the peer down instead of buffering.
+func (c *Channel) WriteTo(w io.Writer) (int64, error) {
+	if c.readAborted() {
+		return 0, io.ErrClosedPipe
+	}
+
+	c.readMu.Lock()
+	defer func() {
+		// Same close handshake as Read.
+		c.readMu.Unlock()
+		if c.readAborted() {
+			c.tryDrainRing()
+		}
+	}()
+
+	var total int64
+	sawDone := false
+
+	for {
+		for {
+			buf, drained, ok := c.ring.Peek()
+			if !ok {
+				break
+			}
+			if drained != nil {
+				_ = defaultAllocator.Put(drained)
+				continue
+			}
+			n, err := w.Write(buf)
+			if n > 0 {
+				total += int64(n)
+				if d := c.ring.Advance(n); d != nil {
+					_ = defaultAllocator.Put(d)
+				}
+				c.flow.OnRead(n)
+			}
+			if err != nil {
+				return total, err
+			}
+			if n < len(buf) {
+				return total, io.ErrShortWrite
+			}
+		}
+
+		if c.readAborted() {
+			return total, io.ErrClosedPipe
+		}
+		if c.readDone.Load() {
+			// See Read: look once more after observing readDone.
+			if sawDone {
+				return total, nil
+			}
+			sawDone = true
+			continue
+		}
+
+		c.waitState.Store(stateWaiting)
+		if _, _, ok := c.ring.Peek(); ok {
+			c.waitState.Store(stateIdle)
+			select {
+			case <-c.notify:
+			default:
+			}
+			continue
+		}
+		if c.readAborted() {
+			c.waitState.Store(stateIdle)
+			return total, io.ErrClosedPipe
+		}
+		if c.readDone.Load() {
+			c.waitState.Store(stateIdle)
+			continue // handled (with sawDone) at the top of the loop
+		}
+
+		select {
+		case <-c.notify:
+		case <-c.closeChan:
+			c.waitState.Store(stateIdle)
+			return total, io.ErrClosedPipe
 		}
 		c.waitState.Store(stateIdle)
 	}

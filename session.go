@@ -111,13 +111,7 @@ type pendingFrame struct {
 }
 
 const (
-	maxPendingBytes    = (8 * DEFAULT_MAX_FRAME_LEN) // per session
-	maxPendingChannels = 8
-	// pendingTTL bounds how long early frames wait for a local OpenChannel.
-	pendingTTL = 5 * time.Second
-	// closedLinger is how long late frames for a closed channel are dropped.
-	closedLinger = 5 * time.Second
-	maxClosedIDs = 32
+	maxClosedIDs = 64
 )
 
 // releasePendingLocked frees a stashed queue's buffers and returns their
@@ -171,7 +165,7 @@ func (s *Session) markClosedLocked(id uint32) {
 			return // best effort: fall back to the old behaviour
 		}
 	}
-	s.closedIDs[id] = now.Add(closedLinger)
+	s.closedIDs[id] = now.Add(s.config.ClosedChannelFrameLingerTTL)
 }
 
 // recentlyClosedLocked reports whether id was closed within closedLinger.
@@ -199,14 +193,16 @@ func (s *Session) stashLocked(id uint32, f pendingFrame) bool {
 	now := time.Now()
 	s.pruneLocked(now)
 	q := s.pending[id]
-	if q == nil && len(s.pending) >= maxPendingChannels {
+	if q == nil && len(s.pending) >= int(s.config.MaxPendingChannels) {
 		return false
 	}
-	if s.pendingBytes+int(f.length) > int(maxPendingBytes) || (q != nil && len(q.frames) >= 4096) {
+
+	if s.pendingBytes+int(f.length) > int(s.config.MaxPendingEarlyFramesPerSession*int(s.config.MaxFrameDataSize)) || (q != nil && len(q.frames) >= 4096) {
 		return false
 	}
+
 	if q == nil {
-		q = &pendingQueue{expires: now.Add(pendingTTL)}
+		q = &pendingQueue{expires: now.Add(s.config.PendingFramesTTL)}
 		s.pending[id] = q
 	}
 	q.frames = append(q.frames, f)
@@ -277,6 +273,12 @@ type Config struct {
 	// Resumption Configuration
 	AllowConnectionResumption bool
 	ConnectionResumeTimeout   time.Duration
+
+	// Pending channel controls
+	MaxPendingChannels              uint //per session
+	MaxPendingEarlyFramesPerSession int
+	PendingFramesTTL                time.Duration // pendingTTL bounds how long early frames wait for a local OpenChannel.
+	ClosedChannelFrameLingerTTL     time.Duration // closedLinger is how long late frames for a closed channel are dropped.
 }
 
 func DefaultConfig() *Config {
@@ -284,20 +286,24 @@ func DefaultConfig() *Config {
 		// NOTE: this used to be DEFAULT_MAX_FRAME_LEN (32 KiB + 17). The allocator
 		// rounds up to the next power of two, so every full-size frame was
 		// backed by a 64 KiB slab: ~2x memory for every in-flight/buffered frame.
-		MaxFrameDataSize:          DEFAULT_MAX_FRAME_DATA_LEN,
-		MaxWriteBufferSize:        32,
-		InitialStreamWindow:       DefaultInitialStreamWindow,
-		InitialSessionWindow:      DefaultInitialSessionWindow,
-		MaxUnknownChannelErrors:   128,
-		KeepAlive:                 true,
-		KeepAliveInterval:         10 * time.Second,
-		KeepAliveTimeout:          30 * time.Second,
-		Reliability:               false,
-		RetransmitTimeout:         150 * time.Millisecond,
-		MaxRetransmit:             8,
-		AckInterval:               10 * time.Millisecond,
-		AllowConnectionResumption: true,
-		ConnectionResumeTimeout:   5 * time.Second,
+		MaxFrameDataSize:                DEFAULT_MAX_FRAME_DATA_LEN,
+		MaxWriteBufferSize:              32,
+		InitialStreamWindow:             DefaultInitialStreamWindow,
+		InitialSessionWindow:            DefaultInitialSessionWindow,
+		MaxUnknownChannelErrors:         128,
+		KeepAlive:                       true,
+		KeepAliveInterval:               10 * time.Second,
+		KeepAliveTimeout:                30 * time.Second,
+		Reliability:                     false,
+		RetransmitTimeout:               150 * time.Millisecond,
+		MaxRetransmit:                   8,
+		AckInterval:                     10 * time.Millisecond,
+		AllowConnectionResumption:       true,
+		ConnectionResumeTimeout:         5 * time.Second,
+		MaxPendingChannels:              32,
+		MaxPendingEarlyFramesPerSession: 16,
+		PendingFramesTTL:                5 * time.Second,
+		ClosedChannelFrameLingerTTL:     5 * time.Second,
 	}
 }
 

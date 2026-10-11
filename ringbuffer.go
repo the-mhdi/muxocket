@@ -230,3 +230,71 @@ func (r *RingBuffer) PartialRead(b []byte) (n int, drainedBuf *[]byte) {
 
 	return n, drainedBuf
 }
+
+// peekSlot returns the consumer's current slot, or nil if the ring is empty.
+// Consumer only.
+func (r *RingBuffer) peekSlot() *slot {
+	cc := r.cChunk
+	for {
+		if r.cHead >= r.cachedTail {
+			r.cachedTail = atomic.LoadUint64(&cc.tail)
+			if r.cHead >= r.cachedTail {
+				if r.cHead >= cc.cap {
+					nextPtr := atomic.LoadPointer(&cc.next)
+					if nextPtr != nil {
+						if cc.cap <= MaxRecycleSlots {
+							atomic.StorePointer(&r.freeChunk, unsafe.Pointer(cc))
+						}
+						cc = (*chunk)(nextPtr)
+						r.cChunk = cc
+						r.cHead = 0
+						r.cachedTail = 0
+						continue
+					}
+				}
+				return nil
+			}
+		}
+		return &cc.slots[r.cHead]
+	}
+}
+
+func (r *RingBuffer) popSlot(s *slot) *[]byte {
+	head := s.head
+	s.buf = nil
+	s.head = nil
+	r.cHead++
+	r.popped++
+	atomic.StoreUint64(&r.totalPopped, r.popped)
+	return head
+}
+
+// Peek returns the unread bytes of the oldest buffer without copying them.
+// If that buffer is empty it is removed and returned as drained (buf is nil),
+// so the caller can recycle it and call Peek again. ok is false when the ring
+// is empty. The returned slice stays valid until Advance consumes it.
+// Consumer only.
+func (r *RingBuffer) Peek() (buf []byte, drained *[]byte, ok bool) {
+	s := r.peekSlot()
+	if s == nil {
+		return nil, nil, false
+	}
+	if len(s.buf) == 0 {
+		return nil, r.popSlot(s), true
+	}
+	return s.buf, nil, true
+}
+
+// Advance consumes n bytes of the buffer returned by Peek. When the buffer is
+// fully consumed it is removed and returned for recycling. Consumer only.
+func (r *RingBuffer) Advance(n int) (drained *[]byte) {
+	s := r.peekSlot()
+	if s == nil {
+		return nil
+	}
+	s.buf = s.buf[n:]
+	if len(s.buf) == 0 {
+		return r.popSlot(s)
+	}
+	return nil
+}
