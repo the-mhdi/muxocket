@@ -40,7 +40,7 @@ const (
 )
 
 const (
-	maxClosedIDs = 64 // maximum number of recently closed channel IDs to remember (Reliability only). it is to prevent a malicious peer from sending a lot of late frames to exhaust memory.
+	maxClosedIDs = 32 // maximum number of recently closed channel IDs to remember (Reliability only). it is to prevent a malicious peer from sending a lot of late frames to exhaust memory.
 )
 
 type Session struct {
@@ -147,138 +147,12 @@ type Config struct {
 	MaxPendingChannels              uint //per session
 	MaxPendingEarlyFramesPerSession int
 	PendingFramesTTL                time.Duration // how long early frames wait for a local OpenChannel.
-	ClosedChannelFrameLingerTTL     time.Duration // how long late frames for a closed channel are dropped.
-}
+	ClosedChannelFrameLingerTTL     time.Duration // how long after late frames for a closed channel are dropped waiting for connection resumption on rebliability on.
 
-// releasePendingLocked frees a stashed queue's buffers and returns their
-// flow-control credit (channelsMu held).
-func (s *Session) releasePendingLocked(id uint32, q *pendingQueue) {
-	for _, f := range q.frames {
-		if f.pBuf != nil {
-			_ = defaultAllocator.Put(f.pBuf)
-		}
-		s.creditDiscarded(f.length)
-	}
-	s.pendingBytes -= q.bytes
-	delete(s.pending, id)
-}
+	//close behavior
+	LingerOnCloseSession bool          //default false //end a stream transport gracefully after Close has flushed
+	LingerCloseTimeout   time.Duration //default: 3s
 
-// pruneLocked drops expired stash queues and closed-ID markers (channelsMu held).
-func (s *Session) pruneLocked(now time.Time) {
-	for id, q := range s.pending {
-		if now.After(q.expires) {
-			s.releasePendingLocked(id, q)
-		}
-	}
-	for id, t := range s.closedIDs {
-		if now.After(t) {
-			delete(s.closedIDs, id)
-		}
-	}
-}
-
-// markClosedLocked records id as recently closed and discards anything
-// stashed for it (channelsMu held).
-func (s *Session) markClosedLocked(id uint32) {
-	if q := s.pending[id]; q != nil {
-		s.releasePendingLocked(id, q)
-	}
-	// Only reliable sessions get stragglers after both FINs (ARQ
-	// retransmits), and only there is dropping lossless: the peer resends
-	// anything a quick legitimate re-open loses. Without Reliability on an
-	// ordered transport the FIN is the channel's last frame, so nothing can
-	// arrive late, and dropping would lose real data from a re-open.
-	if !s.config.Reliability {
-		return
-	}
-	if s.closedIDs == nil {
-		s.closedIDs = make(map[uint32]time.Time)
-	}
-	now := time.Now()
-	if len(s.closedIDs) >= maxClosedIDs {
-		s.pruneLocked(now)
-		if len(s.closedIDs) >= maxClosedIDs {
-			return // best effort: fall back to the old behaviour
-		}
-	}
-	s.closedIDs[id] = now.Add(s.config.ClosedChannelFrameLingerTTL)
-}
-
-// recentlyClosedLocked reports whether id was closed within closedLinger.
-func (s *Session) recentlyClosedLocked(id uint32) bool {
-	t, ok := s.closedIDs[id]
-	if !ok {
-		return false
-	}
-	if time.Now().After(t) {
-		delete(s.closedIDs, id)
-		return false
-	}
-	return true
-}
-
-// stashLocked keeps an early frame (channelsMu held). Returns false if the
-// limits are exceeded and the frame must be dropped.
-func (s *Session) stashLocked(id uint32, f pendingFrame) bool {
-	if s.recentlyClosedLocked(id) {
-		return false
-	}
-	if s.pending == nil {
-		s.pending = make(map[uint32]*pendingQueue)
-	}
-	now := time.Now()
-	s.pruneLocked(now)
-	q := s.pending[id]
-	if q == nil && len(s.pending) >= int(s.config.MaxPendingChannels) {
-		return false
-	}
-
-	if s.pendingBytes+int(f.length) > int(s.config.MaxPendingEarlyFramesPerSession*int(s.config.MaxFrameDataSize)) || (q != nil && len(q.frames) >= 4096) {
-		return false
-	}
-
-	if q == nil {
-		q = &pendingQueue{expires: now.Add(s.config.PendingFramesTTL)}
-		s.pending[id] = q
-	}
-	q.frames = append(q.frames, f)
-	q.bytes += int(f.length)
-	s.pendingBytes += int(f.length)
-	return true
-}
-
-func (s *Session) deliverPending(ch *Channel, frames []pendingFrame) {
-	for _, f := range frames {
-		switch f.flag {
-		case FLG_DATA:
-			if s.config.Reliability {
-				ch.feedReliable(f.offset, f.pBuf, f.length)
-			} else if err := ch.feed(f.pBuf); err != nil {
-				_ = defaultAllocator.Put(f.pBuf)
-				s.creditDiscarded(f.length)
-			}
-		case FLG_FIN:
-			if s.config.Reliability {
-				ch.handleFinReliable(f.offset)
-			} else {
-				ch.remoteClose()
-			}
-		}
-	}
-}
-
-// Done is closed when the session is closed.
-func (s *Session) Done() <-chan struct{} { return s.die }
-
-// IsClosed reports whether the session has been closed.
-func (s *Session) IsClosed() bool { return s.isClosed() }
-
-// RemoteAddr returns the peer address of the current transport, if known.
-func (s *Session) RemoteAddr() net.Addr {
-	if c, ok := s.getConn().(interface{ RemoteAddr() net.Addr }); ok {
-		return c.RemoteAddr()
-	}
-	return nil
 }
 
 func DefaultConfig() *Config {
@@ -304,6 +178,8 @@ func DefaultConfig() *Config {
 		MaxPendingEarlyFramesPerSession: 16,
 		PendingFramesTTL:                5 * time.Second,
 		ClosedChannelFrameLingerTTL:     5 * time.Second,
+		LingerOnCloseSession:            false,
+		LingerCloseTimeout:              3 * time.Second,
 	}
 }
 
@@ -360,6 +236,10 @@ func NewSessionWithID(conn io.ReadWriteCloser, cfg *Config, id string) *Session 
 	}
 	if cfg.ClosedChannelFrameLingerTTL == 0 {
 		cfg.ClosedChannelFrameLingerTTL = 5 * time.Second
+	}
+
+	if cfg.LingerCloseTimeout == 0 {
+		cfg.LingerCloseTimeout = 3 * time.Second
 	}
 
 	s := &Session{
@@ -507,7 +387,8 @@ func (s *Session) getChannel(id uint32) *Channel {
 	return ch
 }
 
-func (s *Session) removeChannel(id uint32) {
+/*
+func (s *Session) RemoveChannel(id uint32) {
 	s.channelsMu.Lock()
 	if _, ok := s.channels[id]; ok {
 		delete(s.channels, id)
@@ -515,6 +396,7 @@ func (s *Session) removeChannel(id uint32) {
 	}
 	s.channelsMu.Unlock()
 }
+*/
 
 // removeChannelIf removes id only if it still maps to ch (a new channel with
 // the same label may have been opened since).
@@ -543,6 +425,7 @@ func (s *Session) writeDataFrame(f writeFrame) error {
 	}
 }
 
+/*
 func (s *Session) writeControlFrame(f writeFrame) error {
 	if s.isClosed() {
 		return ErrSessionClosed
@@ -554,6 +437,7 @@ func (s *Session) writeControlFrame(f writeFrame) error {
 		return nil
 	}
 }
+*/
 
 func (s *Session) writeControlFrameNonBlocking(f writeFrame) bool {
 	if s.isClosed() {
@@ -887,10 +771,12 @@ func (s *Session) ID() string {
 	return s.id
 }
 
+/*
 func (s *Session) alterID(newID string) string {
 	s.id = newID
 	return s.id
 }
+*/
 
 // addCloseHook registers fn to run once the session is closed. If the session
 // is already closed fn runs immediately.
@@ -903,6 +789,137 @@ func (s *Session) addCloseHook(fn func()) {
 	}
 	s.closeHooks = append(s.closeHooks, fn)
 	s.hooksMu.Unlock()
+}
+
+// releasePendingLocked frees a stashed queue's buffers and returns their
+// flow-control credit (channelsMu held).
+func (s *Session) releasePendingLocked(id uint32, q *pendingQueue) {
+	for _, f := range q.frames {
+		if f.pBuf != nil {
+			_ = defaultAllocator.Put(f.pBuf)
+		}
+		s.creditDiscarded(f.length)
+	}
+	s.pendingBytes -= q.bytes
+	delete(s.pending, id)
+}
+
+// pruneLocked drops expired stash queues and closed-ID markers (channelsMu held).
+func (s *Session) pruneLocked(now time.Time) {
+	for id, q := range s.pending {
+		if now.After(q.expires) {
+			s.releasePendingLocked(id, q)
+		}
+	}
+	for id, t := range s.closedIDs {
+		if now.After(t) {
+			delete(s.closedIDs, id)
+		}
+	}
+}
+
+// markClosedLocked records id as recently closed and discards anything
+// stashed for it (channelsMu held).
+func (s *Session) markClosedLocked(id uint32) {
+	if q := s.pending[id]; q != nil {
+		s.releasePendingLocked(id, q)
+	}
+	// Only reliable sessions get stragglers after both FINs (ARQ
+	// retransmits), and only there is dropping lossless: the peer resends
+	// anything a quick legitimate re-open loses. Without Reliability on an
+	// ordered transport the FIN is the channel's last frame, so nothing can
+	// arrive late, and dropping would lose real data from a re-open.
+	if !s.config.Reliability {
+		return
+	}
+	if s.closedIDs == nil {
+		s.closedIDs = make(map[uint32]time.Time)
+	}
+	now := time.Now()
+	if len(s.closedIDs) >= maxClosedIDs {
+		s.pruneLocked(now)
+		if len(s.closedIDs) >= maxClosedIDs {
+			return // best effort: fall back to the old behaviour
+		}
+	}
+	s.closedIDs[id] = now.Add(s.config.ClosedChannelFrameLingerTTL)
+}
+
+// recentlyClosedLocked reports whether id was closed within closedLinger.
+func (s *Session) recentlyClosedLocked(id uint32) bool {
+	t, ok := s.closedIDs[id]
+	if !ok {
+		return false
+	}
+	if time.Now().After(t) {
+		delete(s.closedIDs, id)
+		return false
+	}
+	return true
+}
+
+// stashLocked keeps an early frame (channelsMu held). Returns false if the
+// limits are exceeded and the frame must be dropped.
+func (s *Session) stashLocked(id uint32, f pendingFrame) bool {
+	if s.recentlyClosedLocked(id) {
+		return false
+	}
+	if s.pending == nil {
+		s.pending = make(map[uint32]*pendingQueue)
+	}
+	now := time.Now()
+	s.pruneLocked(now)
+	q := s.pending[id]
+	if q == nil && len(s.pending) >= int(s.config.MaxPendingChannels) {
+		return false
+	}
+
+	if s.pendingBytes+int(f.length) > int(s.config.MaxPendingEarlyFramesPerSession*int(s.config.MaxFrameDataSize)) || (q != nil && len(q.frames) >= 4096) {
+		return false
+	}
+
+	if q == nil {
+		q = &pendingQueue{expires: now.Add(s.config.PendingFramesTTL)}
+		s.pending[id] = q
+	}
+	q.frames = append(q.frames, f)
+	q.bytes += int(f.length)
+	s.pendingBytes += int(f.length)
+	return true
+}
+
+func (s *Session) deliverPending(ch *Channel, frames []pendingFrame) {
+	for _, f := range frames {
+		switch f.flag {
+		case FLG_DATA:
+			if s.config.Reliability {
+				ch.feedReliable(f.offset, f.pBuf, f.length)
+			} else if err := ch.feed(f.pBuf); err != nil {
+				_ = defaultAllocator.Put(f.pBuf)
+				s.creditDiscarded(f.length)
+			}
+		case FLG_FIN:
+			if s.config.Reliability {
+				ch.handleFinReliable(f.offset)
+			} else {
+				ch.remoteClose()
+			}
+		}
+	}
+}
+
+// Done is closed when the session is closed.
+func (s *Session) Done() <-chan struct{} { return s.die }
+
+// IsClosed reports whether the session has been closed.
+func (s *Session) IsClosed() bool { return s.isClosed() }
+
+// RemoteAddr returns the peer address of the current transport, if known.
+func (s *Session) RemoteAddr() net.Addr {
+	if c, ok := s.getConn().(interface{ RemoteAddr() net.Addr }); ok {
+		return c.RemoteAddr()
+	}
+	return nil
 }
 
 func (s *Session) Close() error {
@@ -951,7 +968,11 @@ func (s *Session) Close() error {
 
 		s.connMu.Lock()
 		if s.conn != nil {
-			s.conn.Close()
+			if s.config.LingerOnCloseSession {
+				lingerClose(s.conn, s.config.LingerCloseTimeout)
+			} else {
+				s.conn.Close()
+			}
 		}
 		s.connMu.Unlock()
 
@@ -1025,4 +1046,56 @@ func randomBytes(length int) []byte {
 		log.Printf("randomBytes() ERROR:%v \r\n", err)
 	}
 	return b
+}
+
+// lingerClose ends a stream transport gracefully after Close has flushed
+// its last frames and GOAWAY.
+//
+// Closing a socket while unread bytes sit in its receive buffer makes the
+// kernel send a TCP RST instead of a FIN, and an RST makes the peer's
+// kernel discard data it has received but not yet handed to the
+// application. At the end of a session the peer is usually still sending
+// small frames (window updates, its own FIN or GOAWAY), so a plain Close
+// could destroy the tail of the data we just flushed. This happens more
+// often over TLS, where the receiver has more unread data queued.
+//
+// So, like nginx's lingering_close: half-close (TLS close_notify + TCP FIN
+// via CloseWrite), read and discard until the peer closes too or
+// lingerTimeout passes, then close. Transports without CloseWrite
+// (datagram sub-connections) are closed right away. This is only used for
+// a deliberate Close; a broken transport is still dropped immediately so
+// resumption can start.
+func lingerClose(c io.ReadWriteCloser, timeout time.Duration) {
+	cw, ok := c.(interface{ CloseWrite() error })
+	if !ok {
+		_ = c.Close()
+		return
+	}
+	type deadliner interface {
+		SetReadDeadline(time.Time) error
+		SetWriteDeadline(time.Time) error
+	}
+	d, hasDeadline := c.(deadliner)
+	if hasDeadline {
+		_ = d.SetWriteDeadline(time.Now().Add(timeout))
+	}
+	if err := cw.CloseWrite(); err != nil {
+		_ = c.Close()
+		return
+	}
+	go func() {
+		defer c.Close()
+		if hasDeadline {
+			_ = d.SetReadDeadline(time.Now().Add(timeout))
+		} else {
+			t := time.AfterFunc(timeout, func() { _ = c.Close() })
+			defer t.Stop()
+		}
+		buf := make([]byte, 2048)
+		for {
+			if _, err := c.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
 }
