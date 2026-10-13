@@ -35,10 +35,6 @@ var (
 )
 
 const (
-	// v2: the responder signature covers a hash of the initiator's request
-	// (transcript binding). v1 peers would accept replayed responses.
-	PROTOCOL_VERSION uint8 = 2
-
 	// Minimum sizes
 	MinInitiatorHandshakeLen = 165
 	MaxHandshakeLen          = 512
