@@ -12,19 +12,12 @@ import (
 	"time"
 )
 
+const PROTOCOL_VERSION uint8 = 2
+
 var (
 	ErrSessionClosed    = errors.New("session has been closed")
 	ErrSessionSuspended = errors.New("session is suspended awaiting reconnect")
 )
-
-const (
-	DEFAULT_MAX_FRAME_DATA_LEN   uint32 = 32 << 10
-	DEFAULT_MAX_FRAME_LEN        uint32 = DEFAULT_MAX_FRAME_DATA_LEN + 17
-	DEFAULT_MAX_CHANNEL_DATA_LEN uint32 = DEFAULT_MAX_FRAME_DATA_LEN
-	DEFAULT_MIN_FRAME_LEN        uint32 = 5
-)
-
-const MaxBatchFramesInWriter int = 24
 
 const (
 	FLG_DATA uint8 = 1
@@ -45,8 +38,14 @@ const (
 )
 
 const (
-	maxClosedIDs = 32 // maximum number of recently closed channel IDs to remember (Reliability only). it is to prevent a malicious peer from sending a lot of late frames to exhaust memory.
+	DEFAULT_MAX_FRAME_DATA_LEN   uint32 = 32 << 10
+	DEFAULT_MAX_FRAME_LEN        uint32 = DEFAULT_MAX_FRAME_DATA_LEN + 17
+	DEFAULT_MAX_CHANNEL_DATA_LEN uint32 = DEFAULT_MAX_FRAME_DATA_LEN
+	DEFAULT_MIN_FRAME_LEN        uint32 = 5
 )
+
+const MaxBatchFramesInWriter int = 24
+const MaxClosedIDs int = 32 // maximum number of recently closed channel IDs to remember (Reliability only). it is to prevent a malicious peer from sending a lot of late frames to exhaust memory.
 
 type Session struct {
 	id     string
@@ -874,9 +873,9 @@ func (s *Session) markClosedLocked(id uint32) {
 		s.closedIDs = make(map[uint32]time.Time)
 	}
 	now := time.Now()
-	if len(s.closedIDs) >= maxClosedIDs {
+	if len(s.closedIDs) >= MaxClosedIDs {
 		s.pruneLocked(now)
-		if len(s.closedIDs) >= maxClosedIDs {
+		if len(s.closedIDs) >= MaxClosedIDs {
 			return // best effort: fall back to the old behaviour
 		}
 	}
