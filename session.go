@@ -17,14 +17,14 @@ var (
 	ErrSessionSuspended = errors.New("session is suspended awaiting reconnect")
 )
 
-const maxBatchFrames int = 16
-
 const (
 	DEFAULT_MAX_FRAME_DATA_LEN   uint32 = 32 << 10
 	DEFAULT_MAX_FRAME_LEN        uint32 = DEFAULT_MAX_FRAME_DATA_LEN + 17
 	DEFAULT_MAX_CHANNEL_DATA_LEN uint32 = DEFAULT_MAX_FRAME_DATA_LEN
 	DEFAULT_MIN_FRAME_LEN        uint32 = 5
 )
+
+const MaxBatchFramesInWriter int = 24
 
 const (
 	FLG_DATA uint8 = 1
@@ -36,7 +36,12 @@ const (
 	FLG_ACK  uint8 = 7 // ARQ ACKNOWLEDGEMENT
 	// FLG_GOAWAY is the last frame of a graceful Close: the peer closes the
 	// session immediately instead of suspending it for resumption.
-	FLG_GOAWAY uint8 = 8
+	FLG_GOAWAY uint8 = 8 //session level RST
+	// FLG_RST tells the peer that the sender has fully closed the channel and
+	// discards anything else it receives on it. The peer stops writing and
+	// sends its FIN, so both sides can finalize. Never sent by an older
+	// muxocket; older peers treat it as an unknown flag.
+	FLG_RST uint8 = 9 //Channel level RST
 )
 
 const (
@@ -143,16 +148,18 @@ type Config struct {
 	AllowConnectionResumption bool
 	ConnectionResumeTimeout   time.Duration
 
-	// Pending channel controls
-	MaxPendingChannels              uint //per session
-	MaxPendingEarlyFramesPerSession int
-	PendingFramesTTL                time.Duration // how long early frames wait for a local OpenChannel.
+	// Pending channel behavior: early frames are stashed until the local OpenChannel, or dropped after TTL. Closed channels are remembered for a while to drop late frames instead of stashing them.
+	MaxPendingChannels              uint          //per session //default: 4
+	MaxPendingEarlyFramesPerSession uint          //default: 8
+	MaxPendingEarlyBytesPerSession  uint          // can not be bigger than MaxPendingEarlyFramesPerSession * MaxFrameDataSize, if not set or too big it defaluts to MaxPendingEarlyFramesPerSession * MaxFrameDataSize
+	PendingEarlyFramesTTL           time.Duration // how long early frames wait for a local OpenChannel.
 	ClosedChannelFrameLingerTTL     time.Duration // how long after late frames for a closed channel are dropped waiting for connection resumption on rebliability on.
 
-	//close behavior
-	LingerOnCloseSession bool          //default false //end a stream transport gracefully after Close has flushed
-	LingerCloseTimeout   time.Duration //default: 3s
+	//Close behavior
+	LingerOnCloseSession bool          //default false //end a stream transport(conn) gracefully after Close has flushed
+	LingerCloseTimeout   time.Duration //default: 5s
 
+	ChannelCloseTimeout time.Duration //default: 4s //how long to wait for a peer to close a channel after we have closed it(send FIN).
 }
 
 func DefaultConfig() *Config {
@@ -174,12 +181,14 @@ func DefaultConfig() *Config {
 		AckInterval:                     10 * time.Millisecond,
 		AllowConnectionResumption:       true,
 		ConnectionResumeTimeout:         5 * time.Second,
-		MaxPendingChannels:              32,
-		MaxPendingEarlyFramesPerSession: 16,
-		PendingFramesTTL:                5 * time.Second,
+		MaxPendingChannels:              4,
+		MaxPendingEarlyFramesPerSession: 8,
+		MaxPendingEarlyBytesPerSession:  0, // will be set to MaxPendingEarlyFramesPerSession * MaxFrameDataSize if not set
+		PendingEarlyFramesTTL:           3 * time.Second,
 		ClosedChannelFrameLingerTTL:     5 * time.Second,
 		LingerOnCloseSession:            false,
 		LingerCloseTimeout:              3 * time.Second,
+		ChannelCloseTimeout:             DefaultChannelCloseTimeout,
 	}
 }
 
@@ -221,25 +230,35 @@ func NewSessionWithID(conn io.ReadWriteCloser, cfg *Config, id string) *Session 
 	if cfg.MaxUnknownChannelErrors == 0 {
 		cfg.MaxUnknownChannelErrors = 128
 	}
-	// Zero values (e.g. a Config literal that doesn't set these fields) would
-	// otherwise disable the early-frame stash entirely: every frame sent
-	// before the local OpenChannel would be dropped and counted as an
-	// unknown-channel error.
+
 	if cfg.MaxPendingChannels == 0 {
-		cfg.MaxPendingChannels = 32
+		cfg.MaxPendingChannels = 4
 	}
 	if cfg.MaxPendingEarlyFramesPerSession == 0 {
-		cfg.MaxPendingEarlyFramesPerSession = 16
+		cfg.MaxPendingEarlyFramesPerSession = 8
 	}
-	if cfg.PendingFramesTTL == 0 {
-		cfg.PendingFramesTTL = 5 * time.Second
+
+	if cfg.MaxPendingEarlyBytesPerSession == 0 {
+		cfg.MaxPendingEarlyBytesPerSession = cfg.MaxPendingEarlyFramesPerSession * uint(cfg.MaxFrameDataSize)
+	}
+
+	if cfg.MaxPendingEarlyBytesPerSession > cfg.MaxPendingEarlyFramesPerSession*uint(cfg.MaxFrameDataSize) {
+		cfg.MaxPendingEarlyBytesPerSession = cfg.MaxPendingEarlyFramesPerSession * uint(cfg.MaxFrameDataSize)
+	}
+
+	if cfg.PendingEarlyFramesTTL == 0 {
+		cfg.PendingEarlyFramesTTL = 3 * time.Second
 	}
 	if cfg.ClosedChannelFrameLingerTTL == 0 {
 		cfg.ClosedChannelFrameLingerTTL = 5 * time.Second
 	}
 
 	if cfg.LingerCloseTimeout == 0 {
-		cfg.LingerCloseTimeout = 3 * time.Second
+		cfg.LingerCloseTimeout = 5 * time.Second
+	}
+
+	if cfg.ChannelCloseTimeout == 0 {
+		cfg.ChannelCloseTimeout = DefaultChannelCloseTimeout
 	}
 
 	s := &Session{
@@ -558,6 +577,9 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 					// without counting it as a protocol error.
 					_ = defaultAllocator.Put(pNewbuf)
 					s.creditDiscarded(dataLength)
+					// The peer is still writing to a channel we've already
+					// finalized: its RST was probably lost. Repeat it.
+					s.sendReset(channelID, 0)
 					continue
 				}
 			}
@@ -616,6 +638,22 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 					ch.remoteClose()
 				}
 				ch.feedMu.Unlock()
+			}
+		case FLG_RST:
+			if dataLength != 0 {
+				s.handleDisconnect(c)
+				return
+			}
+			ch := s.getChannel(channelID)
+			if ch == nil {
+				s.channelsMu.Lock()
+				if ch = s.channels[channelID]; ch == nil && !s.isClosed() {
+					s.stashLocked(channelID, pendingFrame{flag: FLG_RST, offset: offset})
+				}
+				s.channelsMu.Unlock()
+			}
+			if ch != nil {
+				ch.peerReset()
 			}
 
 		case FLG_PING:
@@ -874,12 +912,16 @@ func (s *Session) stashLocked(id uint32, f pendingFrame) bool {
 		return false
 	}
 
-	if s.pendingBytes+int(f.length) > int(s.config.MaxPendingEarlyFramesPerSession*int(s.config.MaxFrameDataSize)) || (q != nil && len(q.frames) >= 4096) {
+	if s.pendingBytes+int(f.length) > int(s.config.MaxPendingEarlyBytesPerSession) {
+		return false
+	}
+
+	if q != nil && len(q.frames) >= int(s.config.MaxPendingEarlyFramesPerSession) {
 		return false
 	}
 
 	if q == nil {
-		q = &pendingQueue{expires: now.Add(s.config.PendingFramesTTL)}
+		q = &pendingQueue{expires: now.Add(s.config.PendingEarlyFramesTTL)}
 		s.pending[id] = q
 	}
 	q.frames = append(q.frames, f)
@@ -904,6 +946,8 @@ func (s *Session) deliverPending(ch *Channel, frames []pendingFrame) {
 			} else {
 				ch.remoteClose()
 			}
+		case FLG_RST:
+			ch.peerReset()
 		}
 	}
 }
@@ -1098,4 +1142,17 @@ func lingerClose(c io.ReadWriteCloser, timeout time.Duration) {
 			}
 		}
 	}()
+}
+
+// sendReset queues an FLG_RST for chID without ever blocking the caller (it
+// may be the readLoop). Dropped if the control queue is full: RSTs are
+// repeated whenever more data arrives for the channel.
+func (s *Session) sendReset(chID uint32, offset uint64) {
+	if s.isClosed() {
+		return
+	}
+	select {
+	case s.writer.ctrlQueue <- writeFrame{flag: FLG_RST, chID: chID, offset: offset}:
+	default:
+	}
 }

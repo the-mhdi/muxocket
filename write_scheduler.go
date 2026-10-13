@@ -158,9 +158,9 @@ func releaseFrame(f *writeFrame) {
 
 // batchState holds the writer's reusable scratch arrays.
 type batchState struct {
-	hdrs   [maxBatchFrames + 1][17]byte
-	raw    [(maxBatchFrames + 1) * 2][]byte
-	frames [maxBatchFrames + 1]writeFrame
+	hdrs   [MaxBatchFramesInWriter + 1][17]byte
+	raw    [(MaxBatchFramesInWriter + 1) * 2][]byte
+	frames [MaxBatchFramesInWriter + 1]writeFrame
 	// bufs is the net.Buffers value handed to WriteTo. Keeping it in the
 	// (heap-allocated, reused) batchState stops WriteTo's pointer receiver
 	// from forcing a fresh heap allocation on every batch.
@@ -212,7 +212,7 @@ func (ws *writeScheduler) writeBatch(b *batchState, writer io.Writer, n int) err
 // collect fills b.frames starting at index start without blocking.
 func (ws *writeScheduler) collect(b *batchState, start int) int {
 	n := start
-	for n < maxBatchFrames {
+	for n < MaxBatchFramesInWriter {
 		select {
 		case cf := <-ws.ctrlQueue:
 			b.frames[n] = cf

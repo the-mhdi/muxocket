@@ -1,11 +1,18 @@
 package muxocket
 
 import (
+	"errors"
 	"io"
 	"sync"
 	"sync/atomic"
 	"time"
 )
+
+var (
+	ErrChannelReset = errors.New("channel reset by peer")
+)
+
+const DefaultChannelCloseTimeout = 4 * time.Second
 
 const (
 	stateIdle    uint32 = 0
@@ -38,8 +45,14 @@ type Channel struct {
 	// Half-close: writeClosed means our FIN has been (or is being) queued;
 	// reading continues until the peer's FIN. finalizeOnce removes the
 	// channel once both directions are done and (ARQ) everything is acked.
-	writeClosed  atomic.Bool
-	finQueued    atomic.Bool // FIN is tracked/queued; safe to finalize after it's acked
+	writeClosed atomic.Bool
+	finQueued   atomic.Bool // FIN is tracked/queued; safe to finalize after it's acked
+	// resetByPeer: the peer closed the channel and discards our data (FLG_RST).
+	resetByPeer atomic.Bool
+	// lastRst (unix nanos) rate-limits repeated RSTs; closeTimer enforces
+	// Config.ChannelCloseTimeout after Close.
+	lastRst      atomic.Int64
+	closeTimer   atomic.Pointer[time.Timer]
 	writeOnce    sync.Once
 	finalizeOnce sync.Once
 	done         chan struct{} // closed by finalize
@@ -96,13 +109,13 @@ func (c *Channel) Write(b []byte) (int, error) {
 		return 0, nil
 	}
 	if c.closed.Load() || c.writeClosed.Load() || c.session.isClosed() {
-		return 0, io.ErrClosedPipe
+		return 0, c.writeErr()
 	}
 
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if c.writeClosed.Load() {
-		return 0, io.ErrClosedPipe
+		return 0, c.writeErr()
 	}
 
 	maxChunk := int(c.session.config.MaxFrameDataSize)
@@ -116,6 +129,9 @@ func (c *Channel) Write(b []byte) (int, error) {
 
 		sz, err := c.flow.AcquireCredits(int32(desired))
 		if err != nil {
+			if err == io.ErrClosedPipe {
+				err = c.writeErr()
+			}
 			return totalSent, err
 		}
 
@@ -304,7 +320,7 @@ var (
 // EOF; the write side is not closed (call CloseWrite for that).
 func (c *Channel) ReadFrom(r io.Reader) (int64, error) {
 	if c.closed.Load() || c.writeClosed.Load() || c.session.isClosed() {
-		return 0, io.ErrClosedPipe
+		return 0, c.writeErr()
 	}
 	maxChunk := int(c.session.config.MaxFrameDataSize)
 	var total int64
@@ -357,7 +373,7 @@ func (c *Channel) sendFromRead(pBuf *[]byte, n int) (sent int, keep bool, err er
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	if c.closed.Load() || c.writeClosed.Load() {
-		return 0, true, io.ErrClosedPipe
+		return 0, true, c.writeErr()
 	}
 
 	maxChunk := int(c.session.config.MaxFrameDataSize)
@@ -504,6 +520,7 @@ func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
 			// sender doesn't retransmit into the void until MaxRetransmit.
 			_ = defaultAllocator.Put(pBuf)
 			c.creditSession(length)
+			c.resetPeer(false)
 		}
 		c.readOffset += uint64(length)
 
@@ -714,6 +731,9 @@ func (c *Channel) retransmitAllUnacked() {
 
 func (c *Channel) feed(buffer *[]byte) error {
 	if c.closed.Load() || c.session.isClosed() {
+		if c.closed.Load() && !c.session.config.Reliability {
+			c.resetPeer(false) // reliable mode does this in feedReliable
+		}
 		return io.ErrClosedPipe
 	}
 
@@ -761,6 +781,8 @@ func (c *Channel) closeWrite() {
 				c.writeMu.Lock()
 				c.sendFinLocked()
 				c.writeMu.Unlock()
+				// The caller's maybeFinalize ran before finQueued was set.
+				c.maybeFinalize()
 			}()
 		}
 	})
@@ -796,8 +818,11 @@ func (c *Channel) sendFinLocked() {
 
 // Close fully closes the channel: it half-closes the write side (pending data
 // and the FIN are still delivered) and stops reading; further incoming data
-// is discarded. The channel is removed from the session once the peer has
-// closed too and, with Reliability, everything has been acknowledged.
+// is discarded. If the peer hasn't finished writing yet, it is sent an RST
+// (FLG_RST): its writes then fail with ErrChannelReset and it sends its FIN.
+// The channel is removed from the session once the peer has closed too and,
+// with Reliability, everything has been acknowledged - or, at the latest,
+// after Config.ChannelCloseTimeout.
 func (c *Channel) Close() error {
 	c.closeWrite()
 	c.closeOnce.Do(func() {
@@ -806,6 +831,10 @@ func (c *Channel) Close() error {
 		c.wakeReader()
 		c.flow.WakeWriter()
 		c.tryDrainRing()
+		if !c.readDone.Load() {
+			c.resetPeer(true)
+			c.armCloseTimer()
+		}
 	})
 	c.maybeFinalize()
 	return nil
@@ -838,6 +867,9 @@ func (c *Channel) maybeFinalize() {
 
 func (c *Channel) finalize() {
 	c.finalizeOnce.Do(func() {
+		if t := c.closeTimer.Load(); t != nil {
+			t.Stop()
+		}
 		c.cleanupReliability()
 		c.session.removeChannelIf(c.id, c)
 		close(c.done)
@@ -963,4 +995,62 @@ func (c *Channel) handleFinReliable(finOffset uint64) {
 	if shouldClose {
 		c.remoteClose()
 	}
+}
+
+// writeErr is the error for writes on a write-closed channel.
+func (c *Channel) writeErr() error {
+	if c.resetByPeer.Load() {
+		return ErrChannelReset
+	}
+	return io.ErrClosedPipe
+}
+
+// resetPeer sends an RST unless the peer already finished writing. Repeats
+// (force=false) are limited to one per RetransmitTimeout, so a peer that
+// keeps writing doesn't trigger an RST per frame.
+func (c *Channel) resetPeer(force bool) {
+	if c.readDone.Load() {
+		return
+	}
+	now := time.Now().UnixNano()
+	if !force {
+		last := c.lastRst.Load()
+		if now-last < int64(c.session.config.RetransmitTimeout) || !c.lastRst.CompareAndSwap(last, now) {
+			return
+		}
+	} else {
+		c.lastRst.Store(now)
+	}
+	c.session.sendReset(c.id, atomic.LoadUint64(&c.writeOffset))
+}
+
+// armCloseTimer tears the channel down if it isn't finished after
+// ChannelCloseTimeout (peer never sends its FIN, or never ACKs).
+func (c *Channel) armCloseTimer() {
+	d := c.session.config.ChannelCloseTimeout
+	if d <= 0 {
+		return
+	}
+	t := time.AfterFunc(d, func() {
+		select {
+		case <-c.done:
+		default:
+			c.localClose()
+		}
+	})
+	c.closeTimer.Store(t)
+	select {
+	case <-c.done: // finalized meanwhile; finalize may have missed the timer
+		t.Stop()
+	default:
+	}
+}
+
+// peerReset handles FLG_RST: the peer closed the channel and won't read any
+// more. Stop writing (pending writes fail with ErrChannelReset) and send our
+// FIN so the peer can finalize. Data the peer sent before is still readable.
+func (c *Channel) peerReset() {
+	c.resetByPeer.Store(true)
+	c.closeWrite()
+	c.maybeFinalize()
 }

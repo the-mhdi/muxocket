@@ -29,7 +29,8 @@ payload bytes for DATA frames only:
 | 5 | PONG   | keepalive reply |
 | 6 | UPD    | window update: grant `length` bytes of credit (`chID` 0 = session window) |
 | 7 | ACK    | reliability only: cumulative ACK, everything below `offset` received |
-| 8 | GOAWAY | last frame of a graceful close; peer closes immediately instead of waiting to resume |
+| 8 | GOAWAY | last frame of a graceful close; peer closes the session(not channel) immediately instead of waiting to resume |
+| 9 | RST    | sender has closed the channel and discards further data; receiver stops writing (`ErrChannelReset`) and sends its FIN |
 - Payloads are at most `MaxFrameDataSize` (default 32 KiB). Larger writes are
   split into several frames.
 - On stream transports, frames are written back-to-back. On datagram
@@ -225,6 +226,7 @@ sess, _ := d.Dial(conn) // on a transport failure the session redials and resume
 | `Reliability` | off | ARQ (listener decides) |
 | `RetransmitTimeout`, `MaxRetransmit`, `AckInterval` | 150 ms, 8, 10 ms | ARQ tuning; backoff is exponential (capped at 64× RTO) |
 | `AllowConnectionResumption`, `ConnectionResumeTimeout` | on, 5 s | how long a dropped session waits to be resumed |
+| `ChannelCloseTimeout` | 30 s | max time a `Close`d channel waits for the peer's FIN/ACKs before it's torn down; negative disables |
 | `MaxPendingChannels` | 32 | max channels with buffered early data (data for a label not opened locally yet); beyond this, frames are dropped |
 | `MaxPendingEarlyFramesPerSession` | 16 | early-data budget per session, in full frames (16 × `MaxFrameDataSize` = 512 KiB by default); beyond this, frames are dropped |
 | `PendingFramesTTL` | 5 s | how long early data waits for a local `OpenChannel` before it's discarded |
