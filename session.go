@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-const PROTOCOL_VERSION uint8 = 2
+const PROTOCOL_VERSION uint8 = 1
 
 var (
 	ErrSessionClosed    = errors.New("session has been closed")
