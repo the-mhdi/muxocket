@@ -129,10 +129,10 @@ type PacketFrame struct {
 type Config struct {
 	MaxFrameDataSize uint32
 	//MaxChannelDataSize     uint32
-	MaxWriteBufferSize      uint32
-	InitialStreamWindow     uint32
-	InitialSessionWindow    uint32
-	DrainChannelAfterClose  bool
+	MaxWriteBufferSize   uint32
+	InitialStreamWindow  uint32
+	InitialSessionWindow uint32
+	//DrainChannelAfterClose  bool
 	KeepAlive               bool
 	KeepAliveInterval       time.Duration
 	KeepAliveTimeout        time.Duration
@@ -172,13 +172,13 @@ func DefaultConfig() *Config {
 		InitialSessionWindow:            DefaultInitialSessionWindow,
 		MaxUnknownChannelErrors:         128,
 		KeepAlive:                       true,
-		KeepAliveInterval:               10 * time.Second,
+		KeepAliveInterval:               5 * time.Second,
 		KeepAliveTimeout:                30 * time.Second,
 		Reliability:                     false,
 		RetransmitTimeout:               150 * time.Millisecond,
 		MaxRetransmit:                   8,
 		AckInterval:                     10 * time.Millisecond,
-		AllowConnectionResumption:       true,
+		AllowConnectionResumption:       false,
 		ConnectionResumeTimeout:         5 * time.Second,
 		MaxPendingChannels:              4,
 		MaxPendingEarlyFramesPerSession: 8,

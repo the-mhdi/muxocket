@@ -39,7 +39,7 @@ func newPacketSubConn(ln *Listener, raddr net.Addr) *packetSubConn {
 	return &packetSubConn{
 		ln:         ln,
 		remoteAddr: raddr,
-		queue:      NewBufferRing(8), // Datagram queue depth
+		queue:      NewBufferRing(4), // Datagram queue depth
 		// notify was never initialised: wakeReader() sent on a nil channel
 		// (always hitting `default`) and Read blocked on a nil channel, so a
 		// waiting reader only ever woke up via its deadline. This is what

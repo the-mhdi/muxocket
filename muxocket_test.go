@@ -1424,7 +1424,7 @@ func BenchmarkThroughput_Reliable_TCP(b *testing.B) {
 	ch1, _ := s1.OpenChannel("bench")
 	ch2, _ := s2.OpenChannel("bench")
 
-	chunkSize := 54 * 1024
+	chunkSize := 64 * 1024
 	buf := make([]byte, chunkSize)
 	rand.Read(buf)
 
