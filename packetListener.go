@@ -23,7 +23,7 @@ type packetSubConn struct {
 	waitState atomic.Uint32 // stateIdle or stateWaiting (for Read)
 	readMu    sync.Mutex
 	notify    chan struct{}
-	drainOnce sync.Once
+	//drainOnce sync.Once
 	//readDone  atomic.Bool
 	//currBuf   []byte
 	closed atomic.Bool
@@ -39,7 +39,7 @@ func newPacketSubConn(ln *Listener, raddr net.Addr) *packetSubConn {
 	return &packetSubConn{
 		ln:         ln,
 		remoteAddr: raddr,
-		queue:      NewBufferRing(4), // Datagram queue depth
+		queue:      NewBufferRing(16), // Datagram queue depth
 		// notify was never initialised: wakeReader() sent on a nil channel
 		// (always hitting `default`) and Read blocked on a nil channel, so a
 		// waiting reader only ever woke up via its deadline. This is what
@@ -80,6 +80,7 @@ func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Liste
 		sessionConfig:             cfg,
 		handshakeTimeout:          10 * time.Second,
 		AllowConnectionResumption: true,
+		TransparentResumption:     true,
 		ConnectionResumeTimeout:   cfg.ConnectionResumeTimeout,
 		sessions:                  make(map[string]*activeSession),
 		peerConns:                 make(map[string]*packetSubConn),
@@ -202,10 +203,18 @@ func (s *packetSubConn) Read(b []byte) (int, error) {
 
 	s.readMu.Lock()
 	defer func() {
-		s.readMu.Unlock()
 		if s.closed.Load() || s.ln.closed.Load() {
-			s.tryDrainRing()
+			for {
+				_, head, ok := s.queue.Pop()
+				if !ok {
+					break
+				}
+				if head != nil {
+					_ = defaultAllocator.Put(head)
+				}
+			}
 		}
+		s.readMu.Unlock()
 	}()
 
 	totalRead := 0
@@ -286,23 +295,31 @@ func (s *packetSubConn) Read(b []byte) (int, error) {
 
 		select {
 		case <-s.die:
+			s.waitState.Store(stateIdle)
 			return 0, io.ErrClosedPipe
 		case <-timerCh:
+			s.waitState.Store(stateIdle)
 			return 0, os.ErrDeadlineExceeded
 		case <-s.notify:
+			s.waitState.Store(stateIdle)
 		}
 
-		s.waitState.Store(stateIdle)
 	}
 }
 
 func (s *packetSubConn) Write(b []byte) (int, error) {
-	if s.closed.Load() || s.ln.closed.Load() {
+	if s.closed.Load() || (s.ln != nil && s.ln.closed.Load()) {
 		return 0, io.ErrClosedPipe
 	}
+	if s.ln == nil || s.ln.pconn == nil {
+		// When running with mock/headless subConn (e.g. unit testing out-of-order reassembly),
+		// silently accept outgoing ACKs/control frames rather than panicking or aborting the session.
+		return len(b), nil
+	}
+
 	n, err := s.ln.pconn.WriteTo(b, s.remoteAddr)
 	if err != nil && isTransientDatagramErr(err) {
-		return len(b), nil // datagram lost; not a dead peer
+		return len(b), nil // datagram lost in flight; not a broken socket
 	}
 	return n, err
 }
@@ -311,9 +328,20 @@ func (s *packetSubConn) Write(b []byte) (int, error) {
 // datagrams. The previous writeBuffers method was never called: net.Buffers
 // only recognises the net package's own unexported buffersWriter interface,
 // so header and payload went out as two separate datagrams.
-func (s *packetSubConn) maxDatagramSize() int { return s.ln.mtu }
+func (s *packetSubConn) maxDatagramSize() int {
+	if s.ln == nil || s.ln.mtu <= 0 {
+		return 1400
+	}
+	return s.ln.mtu
+}
 
-func (s *packetSubConn) LocalAddr() net.Addr  { return s.ln.pconn.LocalAddr() }
+func (s *packetSubConn) LocalAddr() net.Addr {
+	if s.ln != nil && s.ln.pconn != nil {
+		return s.ln.pconn.LocalAddr()
+	}
+	return nil
+}
+
 func (s *packetSubConn) RemoteAddr() net.Addr { return s.remoteAddr }
 
 func (s *packetSubConn) SetDeadline(t time.Time) error {
@@ -337,37 +365,39 @@ func (s *packetSubConn) Close() error {
 		s.closed.Store(true)
 		close(s.die)
 
-		key := s.remoteAddr.String()
-		s.ln.peerMu.Lock()
-		if cur, ok := s.ln.peerConns[key]; ok && cur == s {
-			delete(s.ln.peerConns, key)
+		if s.ln != nil && s.remoteAddr != nil {
+			key := s.remoteAddr.String()
+			s.ln.peerMu.Lock()
+			if cur, ok := s.ln.peerConns[key]; ok && cur == s {
+				delete(s.ln.peerConns, key)
+			}
+			s.ln.peerMu.Unlock()
 		}
-		s.ln.peerMu.Unlock()
 
-		s.tryDrainRing() // return queued datagram slabs to the pool
+		s.drainRing()
 	})
 	return nil
 }
 
-func (s *packetSubConn) tryDrainRing() {
-	if s.readMu.TryLock() {
-		s.drainRing()
-		s.readMu.Unlock()
-	}
-}
-
-func (s *packetSubConn) drainRing() {
-	s.drainOnce.Do(func() {
-		var discardedBytes int32
-		for {
-			buf, head, ok := s.queue.Pop()
-			if !ok {
-				break
-			}
-			discardedBytes += int32(len(buf))
-			if head != nil {
-				defaultAllocator.Put(head)
-			}
+/*
+	func (s *packetSubConn) tryDrainRing() {
+		if s.readMu.TryLock() {
+			s.drainRing()
+			s.readMu.Unlock()
 		}
-	})
+	}
+*/
+func (s *packetSubConn) drainRing() {
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+
+	for {
+		_, head, ok := s.queue.Pop()
+		if !ok {
+			break
+		}
+		if head != nil {
+			_ = defaultAllocator.Put(head)
+		}
+	}
 }

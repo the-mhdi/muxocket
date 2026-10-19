@@ -45,7 +45,7 @@ const (
 )
 
 const MaxBatchFramesInWriter int = 24
-const MaxClosedIDs int = 32 // maximum number of recently closed channel IDs to remember (Reliability only). it is to prevent a malicious peer from sending a lot of late frames to exhaust memory.
+const MaxClosedIDs int = 512 // maximum number of recently closed channel IDs to remember (Reliability only). it is to prevent a malicious peer from sending a lot of late frames to exhaust memory.
 
 type Session struct {
 	id     string
@@ -128,8 +128,9 @@ type PacketFrame struct {
 
 type Config struct {
 	MaxFrameDataSize uint32
-	//MaxChannelDataSize     uint32
-	MaxWriteBufferSize   uint32
+
+	// high mtu - low MaxWriteBufferSize | low mtu - high MaxWriteBufferSize
+	MaxWriteBufferSize   uint32 //over ip or udp or any protocol with low mtus, we better increase this from default of 32 to 128 or higher
 	InitialStreamWindow  uint32
 	InitialSessionWindow uint32
 	//DrainChannelAfterClose  bool
@@ -625,7 +626,9 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 			if ch == nil {
 				s.channelsMu.Lock()
 				if ch = s.channels[channelID]; ch == nil && !s.isClosed() {
-					s.stashLocked(channelID, pendingFrame{flag: FLG_FIN, offset: offset})
+					if !s.recentlyClosedLocked(channelID) {
+						s.stashLocked(channelID, pendingFrame{flag: FLG_FIN, offset: offset})
+					}
 				}
 				s.channelsMu.Unlock()
 			}
@@ -647,7 +650,9 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 			if ch == nil {
 				s.channelsMu.Lock()
 				if ch = s.channels[channelID]; ch == nil && !s.isClosed() {
-					s.stashLocked(channelID, pendingFrame{flag: FLG_RST, offset: offset})
+					if !s.recentlyClosedLocked(channelID) {
+						s.stashLocked(channelID, pendingFrame{flag: FLG_RST, offset: offset})
+					}
 				}
 				s.channelsMu.Unlock()
 			}
@@ -698,6 +703,7 @@ func (s *Session) keepAliveLoop() {
 		case <-s.die:
 			return
 		case now := <-ticker.C:
+			s.pruneExpiredPending()
 			if s.rxActivity.Swap(false) || s.suspended.Load() {
 				lastSeen = now
 			} else if now.Sub(lastSeen) > timeout {
@@ -876,7 +882,18 @@ func (s *Session) markClosedLocked(id uint32) {
 	if len(s.closedIDs) >= MaxClosedIDs {
 		s.pruneLocked(now)
 		if len(s.closedIDs) >= MaxClosedIDs {
-			return // best effort: fall back to the old behaviour
+			// Evict the oldest entry so the most recently closed channel is always tracked
+			var oldestID uint32
+			var oldestTime time.Time
+			first := true
+			for k, exp := range s.closedIDs {
+				if first || exp.Before(oldestTime) {
+					oldestID = k
+					oldestTime = exp
+					first = false
+				}
+			}
+			delete(s.closedIDs, oldestID)
 		}
 	}
 	s.closedIDs[id] = now.Add(s.config.ClosedChannelFrameLingerTTL)
@@ -1154,4 +1171,12 @@ func (s *Session) sendReset(chID uint32, offset uint64) {
 	case s.writer.ctrlQueue <- writeFrame{flag: FLG_RST, chID: chID, offset: offset}:
 	default:
 	}
+}
+
+func (s *Session) pruneExpiredPending() {
+	s.channelsMu.Lock()
+	if len(s.pending) > 0 || len(s.closedIDs) > 0 {
+		s.pruneLocked(time.Now())
+	}
+	s.channelsMu.Unlock()
 }

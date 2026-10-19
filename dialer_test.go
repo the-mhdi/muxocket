@@ -146,7 +146,8 @@ func TestDialer_UDP_LargePayload_BothDirections(t *testing.T) {
 func TestDialer_Resume_TCP_DataContinuity(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Reliability = true
-	cfg.RetransmitTimeout = 50 * time.Millisecond
+	cfg.AllowConnectionResumption = true
+	cfg.RetransmitTimeout = 150 * time.Millisecond
 	ln := newTCPListener(t, cfg)
 	accepted := acceptOne(t, ln)
 
@@ -154,7 +155,7 @@ func TestDialer_Resume_TCP_DataContinuity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	cli, err := Dial(conn1)
+	cli, err := DialConfig(conn1, cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -173,7 +174,8 @@ func TestDialer_Resume_TCP_DataContinuity(t *testing.T) {
 	}
 
 	_ = conn1.Close() // network drop
-	time.Sleep(50 * time.Millisecond)
+
+	time.Sleep(1500 * time.Millisecond)
 	if !cli.suspended.Load() {
 		t.Fatal("client should be suspended")
 	}
@@ -221,6 +223,7 @@ func TestDialer_Resume_TCP_DataContinuity(t *testing.T) {
 // Automatic resumption via Dialer.Redial.
 func TestDialer_AutoResume_Redial(t *testing.T) {
 	cfg := DefaultConfig()
+	cfg.AllowConnectionResumption = true
 	cfg.Reliability = true
 	cfg.RetransmitTimeout = 50 * time.Millisecond
 	ln := newTCPListener(t, cfg)

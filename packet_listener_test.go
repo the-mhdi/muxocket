@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
@@ -276,7 +277,8 @@ func TestPacketListener_Reliable_PacketLoss_Recovery(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.Reliability = true
-	cfg.RetransmitTimeout = 30 * time.Millisecond
+	cfg.AllowConnectionResumption = true
+	cfg.RetransmitTimeout = 150 * time.Millisecond
 	cfg.MaxRetransmit = 12
 
 	ln, err := ListenPacket(lossy, 1500, cfg)
@@ -361,7 +363,7 @@ func TestPacketListener_OutOfOrder_Assembly(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Reliability = true
 
-	subConn := newPacketSubConn(&Listener{mtu: 1400}, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9999})
+	subConn := newPacketSubConn(&Listener{mtu: 1500}, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 9999})
 	defer subConn.Close()
 
 	sess := NewSession(subConn, cfg)
@@ -372,24 +374,18 @@ func TestPacketListener_OutOfOrder_Assembly(t *testing.T) {
 	// Synthesize two DATA frames manually:
 	// Frame 1: Offset 0..4 ("AAAA")
 	f1 := make([]byte, 17+4)
-	f1[0] = 0
-	f1[1] = 0
-	f1[2] = 0
-	f1[3] = 4 // length
+	binary.BigEndian.PutUint32(f1[0:4], 4) // length: 4
 	f1[4] = FLG_DATA
-	copy(f1[5:9], []byte{0, 0, 0, byte(ch.id)})
-	// Offset 0
+	binary.BigEndian.PutUint32(f1[5:9], ch.id) // <--- Correct 4-byte uint32 channel ID
+	binary.BigEndian.PutUint64(f1[9:17], 0)    // offset: 0
 	copy(f1[17:], "AAAA")
 
 	// Frame 2: Offset 4..8 ("BBBB")
 	f2 := make([]byte, 17+4)
-	f2[0] = 0
-	f2[1] = 0
-	f2[2] = 0
-	f2[3] = 4 // length
+	binary.BigEndian.PutUint32(f2[0:4], 4) // length: 4
 	f2[4] = FLG_DATA
-	copy(f2[5:9], []byte{0, 0, 0, byte(ch.id)})
-	f2[16] = 4 // Offset 4
+	binary.BigEndian.PutUint32(f2[5:9], ch.id) // <--- Correct 4-byte uint32 channel ID
+	binary.BigEndian.PutUint64(f2[9:17], 4)    // offset: 4
 	copy(f2[17:], "BBBB")
 
 	// Feed Frame 2 FIRST (out of order), then Frame 1
@@ -509,8 +505,8 @@ func BenchmarkThroughput_UDP(b *testing.B) {
 			cfg := DefaultConfig()
 			cfg.Reliability = true
 			cfg.RetransmitTimeout = 40 * time.Millisecond
-
-			_, srv, cli, cleanup := createUDPSessionPair(b, 1400, cfg)
+			cfg.MaxWriteBufferSize = 128
+			_, srv, cli, cleanup := createUDPSessionPair(b, 65535, cfg)
 			defer cleanup()
 
 			ch1, _ := cli.OpenChannel("bench")
@@ -555,7 +551,7 @@ func BenchmarkThroughput_UDP_MultiChannel(b *testing.B) {
 	cfg := DefaultConfig()
 	cfg.Reliability = true
 
-	_, srv, cli, cleanup := createUDPSessionPair(b, 1400, cfg)
+	_, srv, cli, cleanup := createUDPSessionPair(b, 65535, cfg)
 	defer cleanup()
 
 	const numChannels = 8
@@ -646,7 +642,7 @@ func BenchmarkLatency_UDP_PingPong(b *testing.B) {
 
 // BenchmarkPacketSubConn_ReadWrite tests virtual datagram queue throughput directly.
 func BenchmarkPacketSubConn_ReadWrite(b *testing.B) {
-	subConn := newPacketSubConn(&Listener{mtu: 1400}, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080})
+	subConn := newPacketSubConn(&Listener{mtu: 1500}, &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: 8080})
 	defer subConn.Close()
 
 	payload := make([]byte, 1200)

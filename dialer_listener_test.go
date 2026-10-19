@@ -362,6 +362,7 @@ func TestListener_SessionResumption_Success(t *testing.T) {
 
 	cfg := DefaultConfig()
 	cfg.Reliability = true
+	cfg.AllowConnectionResumption = true
 	ln, err := Listen(tcpLn, cfg)
 	if err != nil {
 		t.Fatal(err)
