@@ -50,7 +50,7 @@ const (
 )
 
 const MaxBatchFramesInWriter int = 24
-const MaxClosedIDs int = 512 // maximum number of recently closed channel IDs to remember (Reliability only). it is to prevent a malicious peer from sending a lot of late frames to exhaust memory.
+const MaxClosedIDs int = 64 // maximum number of recently closed channel IDs to remember (Reliability only). it is to prevent a malicious peer from sending a lot of late frames to exhaust memory.
 
 type Session struct {
 	id     string
@@ -483,10 +483,12 @@ func (s *Session) writeControlFrame(f writeFrame) error {
 
 func (s *Session) writeControlFrameNonBlocking(f writeFrame) bool {
 	if s.isClosed() {
+		releaseFrame(&f)
 		return false
 	}
 	select {
 	case <-s.die:
+		releaseFrame(&f)
 		return false
 	case s.writer.ctrlQueue <- f:
 		return true
@@ -498,6 +500,7 @@ func (s *Session) writeControlFrameNonBlocking(f writeFrame) bool {
 		go func() {
 			select {
 			case <-s.die:
+				releaseFrame(&f)
 			case s.writer.ctrlQueue <- f:
 			}
 		}()
@@ -1201,6 +1204,10 @@ func (s *Session) Close() error {
 		s.closedIDs = nil
 		s.pendingBytes = 0
 		s.channelsMu.Unlock()
+
+		s.arqMu.Lock()
+		s.arqSet = nil
+		s.arqMu.Unlock()
 
 		graceful := s.goAwayRecv.Load()
 		for _, ch := range activeChannels {

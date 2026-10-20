@@ -434,6 +434,9 @@ func (s *packetSubConn) Close() error {
 		}
 
 		s.drainRing()
+		s.readMu.Lock()
+		s.queue.Close()
+		s.readMu.Unlock()
 	})
 	return nil
 }

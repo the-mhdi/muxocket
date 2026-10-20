@@ -163,11 +163,11 @@ func releaseFrame(f *writeFrame) {
 	f.sessionFlow = nil
 }
 
-func (ws *writeScheduler) compactAndResolveControlFrames(frames []writeFrame) []writeFrame {
-	out := frames[:0]
+func (ws *writeScheduler) compactAndResolveControlFrames(b *batchState, n int) int {
+	outIdx := 0
 
-	for i := range frames {
-		f := &frames[i]
+	for i := 0; i < n; i++ {
+		f := &b.frames[i]
 
 		// 1. Resolve late-bound ACK offset
 		if ch := f.ackCh; ch != nil {
@@ -180,6 +180,8 @@ func (ws *writeScheduler) compactAndResolveControlFrames(frames []writeFrame) []
 			delta := sf.unflushed.Swap(0)
 			sf.updPending.Store(false)
 			if delta <= 0 {
+				releaseFrame(f)
+				*f = writeFrame{}
 				continue // discard empty update
 			}
 			f.length = uint32(delta)
@@ -190,6 +192,8 @@ func (ws *writeScheduler) compactAndResolveControlFrames(frames []writeFrame) []
 			delta := sf.unflushed.Swap(0)
 			sf.updPending.Store(false)
 			if delta <= 0 {
+				releaseFrame(f)
+				*f = writeFrame{}
 				continue // discard empty update
 			}
 			f.length = uint32(delta)
@@ -199,10 +203,10 @@ func (ws *writeScheduler) compactAndResolveControlFrames(frames []writeFrame) []
 		merged := false
 		if f.flag == FLG_ACK {
 			// If an earlier ACK for the same channel exists in this batch, keep the newer offset
-			for j := range out {
-				if out[j].flag == FLG_ACK && out[j].chID == f.chID {
-					if f.offset > out[j].offset {
-						out[j].offset = f.offset
+			for j := 0; j < outIdx; j++ {
+				if b.frames[j].flag == FLG_ACK && b.frames[j].chID == f.chID {
+					if f.offset > b.frames[j].offset {
+						b.frames[j].offset = f.offset
 					}
 					merged = true
 					break
@@ -210,20 +214,28 @@ func (ws *writeScheduler) compactAndResolveControlFrames(frames []writeFrame) []
 			}
 		} else if f.flag == FLG_UPD {
 			// If an earlier UPD for the same channel/session exists, combine the credits
-			for j := range out {
-				if out[j].flag == FLG_UPD && out[j].chID == f.chID {
-					out[j].length += f.length
+			for j := 0; j < outIdx; j++ {
+				if b.frames[j].flag == FLG_UPD && b.frames[j].chID == f.chID {
+					b.frames[j].length += f.length
 					merged = true
 					break
 				}
 			}
 		}
 
-		if !merged {
-			out = append(out, *f)
+		if merged {
+			releaseFrame(f)
+			*f = writeFrame{}
+			continue
 		}
+
+		if outIdx != i {
+			b.frames[outIdx] = *f
+			*f = writeFrame{}
+		}
+		outIdx++
 	}
-	return out
+	return outIdx
 }
 
 // batchState holds the writer's reusable scratch arrays.
@@ -237,13 +249,20 @@ type batchState struct {
 	bufs net.Buffers
 }
 
-// writeBatch encodes and writes frames, then releases their buffers.
+// writeBatch encodes and writes frames, then releases their buffers and zeroes slots.
 func (ws *writeScheduler) writeBatch(b *batchState, writer io.Writer, n int) error {
-	// Compact control frames in-place
-	frames := ws.compactAndResolveControlFrames(b.frames[:n])
-	if len(frames) == 0 {
+	outCount := ws.compactAndResolveControlFrames(b, n)
+	if outCount == 0 {
 		return nil
 	}
+	frames := b.frames[:outCount]
+
+	defer func() {
+		for i := 0; i < outCount; i++ {
+			releaseFrame(&frames[i])
+			frames[i] = writeFrame{}
+		}
+	}()
 
 	var err error
 	if dw, ok := writer.(datagramWriter); ok {
@@ -267,9 +286,6 @@ func (ws *writeScheduler) writeBatch(b *batchState, writer io.Writer, n int) err
 		}
 	}
 
-	for i := range frames {
-		releaseFrame(&frames[i])
-	}
 	return err
 }
 
@@ -331,6 +347,7 @@ func (ws *writeScheduler) writeLoop() {
 			case <-ws.die:
 				for i := 0; i < batchCount; i++ {
 					releaseFrame(&b.frames[i])
+					b.frames[i] = writeFrame{}
 				}
 				ws.drainAndCleanup()
 				return

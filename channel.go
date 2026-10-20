@@ -22,6 +22,10 @@ const (
 	stateWaiting uint32 = 1
 )
 
+var reorderPool = sync.Pool{
+	New: func() any { return new(reorderFrame) },
+}
+
 type Channel struct {
 	id      uint32
 	session *Session
@@ -243,6 +247,7 @@ func (c *Channel) Read(b []byte) (int, error) {
 			// may have been sampled just before that push: look once more,
 			// or the tail of the stream was lost behind a premature EOF.
 			if sawDone {
+				c.ring.Close()
 				return 0, io.EOF
 			}
 			sawDone = true
@@ -287,6 +292,7 @@ func (c *Channel) Read(b []byte) (int, error) {
 		if c.readDone.Load() {
 			c.waitState.Store(stateIdle)
 			if sawDone {
+				c.ring.Close()
 				return 0, io.EOF
 			}
 			sawDone = true
@@ -460,6 +466,7 @@ func (c *Channel) WriteTo(w io.Writer) (int64, error) {
 		if c.readDone.Load() {
 			// See Read: look once more after observing readDone.
 			if sawDone {
+				c.ring.Close()
 				return total, nil
 			}
 			sawDone = true
@@ -614,6 +621,10 @@ func (c *Channel) onAck(ackOffset uint64) {
 		c.unacked = c.unacked[:n]
 		if n == 0 {
 			drained = true
+			if c.inARQ {
+				c.inARQ = false
+				c.session.arqRemove(c)
+			}
 			if cap(c.unacked) > maxRetainedUnacked {
 				c.unacked = nil // drop an unusually large backing array
 			}
@@ -743,6 +754,7 @@ func (c *Channel) feedReliablePayload(offset uint64, payload []byte, head *[]byt
 		if head != nil {
 			_ = defaultAllocator.Put(head)
 		}
+		c.creditSession(length)
 
 	case offset+uint64(length) <= c.readOffset:
 		// 1. Packet already acknowledged and received: discard duplicate and re-ACK
@@ -770,6 +782,8 @@ func (c *Channel) feedReliablePayload(offset uint64, payload []byte, head *[]byt
 				c.creditSession(nextFrame.length)
 			}
 			c.readOffset += uint64(nextFrame.length)
+			*nextFrame = reorderFrame{}
+			reorderPool.Put(nextFrame)
 		}
 
 		shouldClose = c.hasFin && c.readOffset >= c.finOffset
@@ -782,12 +796,12 @@ func (c *Channel) feedReliablePayload(offset uint64, payload []byte, head *[]byt
 				_ = defaultAllocator.Put(head) // exceeds legal window limit
 			}
 		} else if _, exists := c.reorderMap[offset]; !exists {
-			c.reorderMap[offset] = &reorderFrame{
-				payload: payload,
-				head:    head,
-				offset:  offset,
-				length:  length,
-			}
+			rf := reorderPool.Get().(*reorderFrame)
+			rf.payload = payload
+			rf.head = head
+			rf.offset = offset
+			rf.length = length
+			c.reorderMap[offset] = rf
 		} else {
 			if head != nil {
 				_ = defaultAllocator.Put(head) // duplicate out-of-order frame
@@ -931,10 +945,18 @@ func (c *Channel) maybeFinalize() {
 
 func (c *Channel) finalize() {
 	c.finalizeOnce.Do(func() {
-		if t := c.closeTimer.Load(); t != nil {
+		if t := c.closeTimer.Swap(nil); t != nil {
+			t.Stop()
+		}
+		if t := c.ackTimer.Swap(nil); t != nil {
 			t.Stop()
 		}
 		c.cleanupReliability()
+		c.readMu.Lock()
+		if !c.drainable.Load() || c.ring.Length() == 0 {
+			c.ring.Close()
+		}
+		c.readMu.Unlock()
 		c.session.removeChannelIf(c.id, c)
 		close(c.done)
 	})
@@ -988,6 +1010,12 @@ func (c *Channel) Label() string {
 }
 
 func (c *Channel) cleanupReliability() {
+	if t := c.ackTimer.Swap(nil); t != nil {
+		t.Stop()
+	}
+	if t := c.closeTimer.Swap(nil); t != nil {
+		t.Stop()
+	}
 	c.unackedMu.Lock()
 	unacked := c.unacked
 	c.unacked = nil
@@ -1006,6 +1034,8 @@ func (c *Channel) cleanupReliability() {
 			defaultAllocator.Put(f.head)
 			f.head = nil
 		}
+		*f = reorderFrame{}
+		reorderPool.Put(f)
 	}
 	c.reorderMap = nil
 	c.reorderMu.Unlock()
@@ -1040,6 +1070,7 @@ func (c *Channel) drainRing() {
 		if discardedBytes > 0 && c.session.flow != nil && c.session.flow.enabled {
 			c.session.flow.OnRead(discardedBytes)
 		}
+		c.ring.Close()
 	})
 }
 

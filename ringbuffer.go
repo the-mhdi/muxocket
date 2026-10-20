@@ -1,6 +1,7 @@
 package muxocket
 
 import (
+	"sync"
 	"sync/atomic"
 	"unsafe"
 )
@@ -59,9 +60,21 @@ type chunk struct {
 	_    cacheLinePad
 }
 
+var chunkPool = sync.Pool{
+	New: func() any {
+		return &chunk{
+			slots: make([]slot, MinChunkCap),
+			cap:   MinChunkCap,
+		}
+	},
+}
+
 func newChunk(capacity int) *chunk {
-	if capacity < MinChunkCap {
-		capacity = MinChunkCap
+	if capacity <= MinChunkCap {
+		c := chunkPool.Get().(*chunk)
+		c.tail = 0
+		c.next = nil
+		return c
 	}
 	cap := 1
 	for cap < capacity {
@@ -70,6 +83,36 @@ func newChunk(capacity int) *chunk {
 	return &chunk{
 		slots: make([]slot, cap),
 		cap:   uint64(cap),
+	}
+}
+
+func recycleChunk(c *chunk) {
+	if c == nil {
+		return
+	}
+	if c.cap == MinChunkCap {
+		for i := range c.slots {
+			c.slots[i] = slot{}
+		}
+		c.tail = 0
+		c.next = nil
+		chunkPool.Put(c)
+	}
+}
+
+// Close recycles the ring buffer's chunks to the chunk pool.
+func (r *RingBuffer) Close() {
+	freePtr := atomic.SwapPointer(&r.freeChunk, nil)
+	if freePtr != nil {
+		recycleChunk((*chunk)(freePtr))
+	}
+	cur := r.cChunk
+	r.cChunk = nil
+	r.pChunk = nil
+	for cur != nil {
+		next := (*chunk)(atomic.LoadPointer(&cur.next))
+		recycleChunk(cur)
+		cur = next
 	}
 }
 
@@ -92,19 +135,31 @@ func (r *RingBuffer) Length() int {
 
 func (r *RingBuffer) Push(buf []byte, head *[]byte) {
 	pc := r.pChunk
+	if pc == nil {
+		if head != nil {
+			_ = defaultAllocator.Put(head)
+		}
+		return
+	}
 
 	if pc.tail >= pc.cap {
 		var next *chunk
 		currentLag := r.Length()
 
 		if currentLag == 0 {
-			atomic.StorePointer(&r.freeChunk, nil)
+			freePtr := atomic.SwapPointer(&r.freeChunk, nil)
+			if freePtr != nil {
+				recycleChunk((*chunk)(freePtr))
+			}
 			next = newChunk(MinChunkCap)
 		} else {
 			// Backlog exists: reuse free-list chunk or allocate larger
 			freePtr := atomic.SwapPointer(&r.freeChunk, nil)
 			if freePtr != nil {
 				next = (*chunk)(freePtr)
+				for i := range next.slots {
+					next.slots[i] = slot{}
+				}
 				next.tail = 0
 				next.next = nil
 			} else {
@@ -138,6 +193,9 @@ func (r *RingBuffer) Push(buf []byte, head *[]byte) {
 // Pop is called ONLY by the Consumer goroutine.
 func (r *RingBuffer) Pop() (buf []byte, head *[]byte, ok bool) {
 	cc := r.cChunk
+	if cc == nil {
+		return nil, nil, false
+	}
 
 	for {
 		if r.cHead >= r.cachedTail {
@@ -148,7 +206,10 @@ func (r *RingBuffer) Pop() (buf []byte, head *[]byte, ok bool) {
 					if nextPtr != nil {
 						// Only retain chunks in free-list if <= MaxRecycleSlots
 						if cc.cap <= MaxRecycleSlots {
-							atomic.StorePointer(&r.freeChunk, unsafe.Pointer(cc))
+							prev := atomic.SwapPointer(&r.freeChunk, unsafe.Pointer(cc))
+							if prev != nil {
+								recycleChunk((*chunk)(prev))
+							}
 						}
 
 						cc = (*chunk)(nextPtr)
@@ -178,6 +239,9 @@ func (r *RingBuffer) Pop() (buf []byte, head *[]byte, ok bool) {
 
 func (r *RingBuffer) PartialRead(b []byte) (n int, drainedBuf *[]byte) {
 	cc := r.cChunk
+	if cc == nil {
+		return 0, nil
+	}
 
 	for {
 		if r.cHead >= r.cachedTail {
@@ -187,7 +251,10 @@ func (r *RingBuffer) PartialRead(b []byte) (n int, drainedBuf *[]byte) {
 					nextPtr := atomic.LoadPointer(&cc.next)
 					if nextPtr != nil {
 						if cc.cap <= MaxRecycleSlots {
-							atomic.StorePointer(&r.freeChunk, unsafe.Pointer(cc))
+							prev := atomic.SwapPointer(&r.freeChunk, unsafe.Pointer(cc))
+							if prev != nil {
+								recycleChunk((*chunk)(prev))
+							}
 						}
 
 						cc = (*chunk)(nextPtr)
@@ -235,6 +302,9 @@ func (r *RingBuffer) PartialRead(b []byte) (n int, drainedBuf *[]byte) {
 // Consumer only.
 func (r *RingBuffer) peekSlot() *slot {
 	cc := r.cChunk
+	if cc == nil {
+		return nil
+	}
 	for {
 		if r.cHead >= r.cachedTail {
 			r.cachedTail = atomic.LoadUint64(&cc.tail)
@@ -243,7 +313,10 @@ func (r *RingBuffer) peekSlot() *slot {
 					nextPtr := atomic.LoadPointer(&cc.next)
 					if nextPtr != nil {
 						if cc.cap <= MaxRecycleSlots {
-							atomic.StorePointer(&r.freeChunk, unsafe.Pointer(cc))
+							prev := atomic.SwapPointer(&r.freeChunk, unsafe.Pointer(cc))
+							if prev != nil {
+								recycleChunk((*chunk)(prev))
+							}
 						}
 						cc = (*chunk)(nextPtr)
 						r.cChunk = cc
