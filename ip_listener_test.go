@@ -566,7 +566,7 @@ func BenchmarkThroughput_RawIP(b *testing.B) {
 				_ = ipConn.SetWriteBuffer(4 * 1024 * 1024)
 			}
 
-			ln, err := ListenPacket(pconn, 1400, cfg)
+			ln, err := ListenPacket(pconn, 9000, cfg)
 			if err != nil {
 				_ = pconn.Close()
 				b.Fatalf("ListenPacket constructor failed: %v", err)

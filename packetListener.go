@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"sync"
 	"sync/atomic"
@@ -12,22 +13,23 @@ import (
 
 // ============================================================================
 // VIRTUAL DATAGRAM CONNECTION ADAPTER (packetSubConn)
-// Bridges UDP datagrams into an io.ReadWriteCloser stream for Session
+// Bridges UDP/IP datagrams into an io.ReadWriteCloser stream for Session
 // ============================================================================
 
 type packetSubConn struct {
 	ln         *Listener
 	remoteAddr net.Addr
 
+	// Fast 0-alloc identifiers
+	udpAddrPort netip.AddrPort
+	ipAddr      netip.Addr
+
 	queue     RingBuffer
 	waitState atomic.Uint32 // stateIdle or stateWaiting (for Read)
 	readMu    sync.Mutex
 	notify    chan struct{}
-	//drainOnce sync.Once
-	//readDone  atomic.Bool
-	//currBuf   []byte
-	closed atomic.Bool
-	die    chan struct{}
+	closed    atomic.Bool
+	die       chan struct{}
 
 	closeOnce sync.Once
 
@@ -36,21 +38,24 @@ type packetSubConn struct {
 }
 
 func newPacketSubConn(ln *Listener, raddr net.Addr) *packetSubConn {
-	return &packetSubConn{
+	sub := &packetSubConn{
 		ln:         ln,
 		remoteAddr: raddr,
-		queue:      NewBufferRing(16), // Datagram queue depth
-		// notify was never initialised: wakeReader() sent on a nil channel
-		// (always hitting `default`) and Read blocked on a nil channel, so a
-		// waiting reader only ever woke up via its deadline. This is what
-		// hung TestListenPacket_UDP_HandshakeAndData.
-		notify: make(chan struct{}, 1),
-		die:    make(chan struct{}),
+		queue:      NewBufferRing(16),
+		notify:     make(chan struct{}, 1),
+		die:        make(chan struct{}),
 	}
+	if u, ok := raddr.(*net.UDPAddr); ok {
+		sub.udpAddrPort = u.AddrPort()
+	} else if ip, ok := raddr.(*net.IPAddr); ok {
+		if a, ok := netip.AddrFromSlice(ip.IP); ok {
+			sub.ipAddr = a.Unmap()
+		}
+	}
+	return sub
 }
 
 // ListenPacket creates a datagram-oriented listener (UDP, Raw IP).
-// config is optional; if omitted, DefaultConfig() is used.
 func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Listener, error) {
 	if packetConn == nil {
 		return nil, errors.New("packetConn cannot be nil")
@@ -61,54 +66,35 @@ func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Liste
 
 	var cfg *Config
 	if len(config) > 0 && config[0] != nil {
-		c := *config[0] // don't mutate the caller's config
+		c := *config[0]
 		cfg = &c
 	} else {
 		cfg = DefaultConfig()
 	}
-	// Every frame must fit in one datagram (header + payload <= MTU), and
-	// packetReadLoop reads into MTU-sized buffers, so larger datagrams were
-	// silently truncated. The value is advertised to the dialer in the
-	// handshake, so both directions honour it.
 	if maxData := uint32(MTU - 17); cfg.MaxFrameDataSize == 0 || cfg.MaxFrameDataSize > maxData {
 		cfg.MaxFrameDataSize = maxData
 	}
 
-	if ipConn, ok := packetConn.(*net.IPConn); ok {
-		err := ipConn.SetReadBuffer(cfg.SystemPacketReadBuffer)
-		if err != nil {
-			return nil, err
-		}
-		err = ipConn.SetWriteBuffer(cfg.SystemPacketWriteBuffer)
-		if err != nil {
-			return nil, err
-		}
+	var udpConn *net.UDPConn
+	if u, ok := packetConn.(*net.UDPConn); ok {
+		udpConn = u
+		_ = u.SetReadBuffer(cfg.SystemPacketReadBuffer)
+		_ = u.SetWriteBuffer(cfg.SystemPacketWriteBuffer)
 	}
 
-	if ipConn, ok := packetConn.(*net.UDPConn); ok {
-		err := ipConn.SetReadBuffer(cfg.SystemPacketReadBuffer)
-		if err != nil {
-			return nil, err
-		}
-		err = ipConn.SetWriteBuffer(cfg.SystemPacketWriteBuffer)
-		if err != nil {
-			return nil, err
-		}
+	if ipConn, ok := packetConn.(*net.IPConn); ok {
+		_ = ipConn.SetReadBuffer(cfg.SystemPacketReadBuffer)
+		_ = ipConn.SetWriteBuffer(cfg.SystemPacketWriteBuffer)
 	}
 
 	if ugConn, ok := packetConn.(*net.UnixConn); ok {
-		err := ugConn.SetReadBuffer(cfg.SystemPacketReadBuffer)
-		if err != nil {
-			return nil, err
-		}
-		err = ugConn.SetWriteBuffer(cfg.SystemPacketWriteBuffer)
-		if err != nil {
-			return nil, err
-		}
+		_ = ugConn.SetReadBuffer(cfg.SystemPacketReadBuffer)
+		_ = ugConn.SetWriteBuffer(cfg.SystemPacketWriteBuffer)
 	}
 
 	ln := &Listener{
 		pconn:                     packetConn,
+		udpConn:                   udpConn,
 		sessionConfig:             cfg,
 		handshakeTimeout:          10 * time.Second,
 		AllowConnectionResumption: true,
@@ -116,13 +102,14 @@ func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Liste
 		ConnectionResumeTimeout:   cfg.ConnectionResumeTimeout,
 		sessions:                  make(map[string]*activeSession),
 		peerConns:                 make(map[string]*packetSubConn),
+		peerUDPConns:              make(map[netip.AddrPort]*packetSubConn),
+		peerIPConns:               make(map[netip.Addr]*packetSubConn),
 		acceptChan:                make(chan *Session, 64),
 		acceptDone:                make(chan struct{}),
 		mtu:                       MTU,
 		die:                       make(chan struct{}),
 	}
 
-	// Start packet reading loop to route UDP datagrams
 	go ln.packetReadLoop(MTU)
 
 	return ln, nil
@@ -146,26 +133,47 @@ func (ln *Listener) handleIncomingPacketConn(subConn *packetSubConn) {
 	}
 }
 
-// packetReadLoop reads incoming UDP datagrams and routes them to per-client subConns
+// packetReadLoop reads incoming datagrams and routes them with zero allocation on the fast paths.
 func (ln *Listener) packetReadLoop(MTU int) {
-	// Raw IPv4 sockets read the IP header (up to 60 bytes) into the buffer
-	// before ReadFrom strips it, so an MTU-sized buffer silently truncated
-	// every full-size datagram. Read with slack and drop oversized datagrams
-	// instead of feeding a truncated frame into the stream.
 	bufSize := MTU + 64
 	if bufSize > MaxAllocSize {
 		bufSize = MaxAllocSize
 	}
+
 	for {
 		if ln.closed.Load() {
 			return
 		}
 		pBuf := defaultAllocator.Get(bufSize)
 		*pBuf = (*pBuf)[:bufSize]
-		n, raddr, err := ln.pconn.ReadFrom(*pBuf)
+
+		var n int
+		var raddr net.Addr
+		var udpAddrPort netip.AddrPort
+		var ipAddr netip.Addr
+		var isUDP, isIP bool
+		var err error
+
+		if ln.udpConn != nil {
+			// Fast path 1: 0-alloc UDP ingress via ReadFromUDPAddrPort
+			n, udpAddrPort, err = ln.udpConn.ReadFromUDPAddrPort(*pBuf)
+			isUDP = true
+		} else {
+			// Fast path 2: Raw IP / PacketConn
+			n, raddr, err = ln.pconn.ReadFrom(*pBuf)
+			if err == nil {
+				if ip, ok := raddr.(*net.IPAddr); ok {
+					if a, ok := netip.AddrFromSlice(ip.IP); ok {
+						ipAddr = a.Unmap()
+						isIP = true
+					}
+				}
+			}
+		}
+
 		if err == nil && n > MTU {
 			defaultAllocator.Put(pBuf)
-			continue // larger than negotiated: would desync the frame stream
+			continue
 		}
 		if err != nil {
 			defaultAllocator.Put(pBuf)
@@ -179,12 +187,21 @@ func (ln *Listener) packetReadLoop(MTU int) {
 			continue
 		}
 
-		raddrStr := raddr.String()
-		ln.peerMu.RLock()
-		subConn, exists := ln.peerConns[raddrStr]
-		ln.peerMu.RUnlock()
+		*pBuf = (*pBuf)[:n]
 
-		*pBuf = (*pBuf)[:n] // only hand the bytes actually received to the stream
+		// 0-alloc Map Lookup
+		var subConn *packetSubConn
+		var exists bool
+
+		ln.peerMu.RLock()
+		if isUDP {
+			subConn, exists = ln.peerUDPConns[udpAddrPort]
+		} else if isIP {
+			subConn, exists = ln.peerIPConns[ipAddr]
+		} else {
+			subConn, exists = ln.peerConns[raddr.String()]
+		}
+		ln.peerMu.RUnlock()
 
 		if exists && !subConn.closed.Load() {
 			if subConn.feed(pBuf) != nil {
@@ -193,9 +210,22 @@ func (ln *Listener) packetReadLoop(MTU int) {
 			continue
 		}
 
-		newSubConn := newPacketSubConn(ln, raddr)
+		// New client registration
+		var remoteAddr net.Addr
+		if isUDP {
+			remoteAddr = net.UDPAddrFromAddrPort(udpAddrPort)
+		} else {
+			remoteAddr = raddr
+		}
+
+		newSubConn := newPacketSubConn(ln, remoteAddr)
 		ln.peerMu.Lock()
-		ln.peerConns[raddrStr] = newSubConn
+		if isUDP {
+			ln.peerUDPConns[udpAddrPort] = newSubConn
+		} else if isIP {
+			ln.peerIPConns[ipAddr] = newSubConn
+		}
+		ln.peerConns[remoteAddr.String()] = newSubConn
 		ln.peerMu.Unlock()
 
 		if newSubConn.feed(pBuf) != nil {
@@ -251,9 +281,6 @@ func (s *packetSubConn) Read(b []byte) (int, error) {
 
 	totalRead := 0
 
-	// One timer per Read call. The old code created a new timer (and a new
-	// deferred Stop) on every loop iteration, accumulating timers/defers for
-	// as long as a Read stayed blocked.
 	var timerCh <-chan time.Time
 	if dl := s.readDeadline.Load(); dl != nil && !dl.IsZero() {
 		d := time.Until(*dl)
@@ -266,7 +293,6 @@ func (s *packetSubConn) Read(b []byte) (int, error) {
 	}
 
 	for {
-
 		for len(b) > 0 {
 			n, drainedBuf := s.queue.PartialRead(b)
 			if drainedBuf != nil {
@@ -335,9 +361,9 @@ func (s *packetSubConn) Read(b []byte) (int, error) {
 		case <-s.notify:
 			s.waitState.Store(stateIdle)
 		}
-
 	}
 }
+
 func (s *packetSubConn) ReadPacket() (*[]byte, error) {
 	if s.closed.Load() || s.ln.closed.Load() {
 		return nil, io.ErrClosedPipe
@@ -371,22 +397,24 @@ func (s *packetSubConn) Write(b []byte) (int, error) {
 		return 0, io.ErrClosedPipe
 	}
 	if s.ln == nil || s.ln.pconn == nil {
-		// When running with mock/headless subConn (e.g. unit testing out-of-order reassembly),
-		// silently accept outgoing ACKs/control frames rather than panicking or aborting the session.
 		return len(b), nil
 	}
 
-	n, err := s.ln.pconn.WriteTo(b, s.remoteAddr)
+	var n int
+	var err error
+	if s.ln.udpConn != nil && s.udpAddrPort.IsValid() {
+		// Fast 0-alloc write for UDP
+		n, err = s.ln.udpConn.WriteToUDPAddrPort(b, s.udpAddrPort)
+	} else {
+		n, err = s.ln.pconn.WriteTo(b, s.remoteAddr)
+	}
+
 	if err != nil && isTransientDatagramErr(err) {
-		return len(b), nil // datagram lost in flight; not a broken socket
+		return len(b), nil
 	}
 	return n, err
 }
 
-// maxDatagramSize makes the write scheduler pack whole frames into single
-// datagrams. The previous writeBuffers method was never called: net.Buffers
-// only recognises the net package's own unexported buffersWriter interface,
-// so header and payload went out as two separate datagrams.
 func (s *packetSubConn) maxDatagramSize() int {
 	if s.ln == nil || s.ln.mtu <= 0 {
 		return 1400
@@ -424,11 +452,16 @@ func (s *packetSubConn) Close() error {
 		s.closed.Store(true)
 		close(s.die)
 
-		if s.ln != nil && s.remoteAddr != nil {
-			key := s.remoteAddr.String()
+		if s.ln != nil {
 			s.ln.peerMu.Lock()
-			if cur, ok := s.ln.peerConns[key]; ok && cur == s {
-				delete(s.ln.peerConns, key)
+			if s.udpAddrPort.IsValid() {
+				delete(s.ln.peerUDPConns, s.udpAddrPort)
+			}
+			if s.ipAddr.IsValid() {
+				delete(s.ln.peerIPConns, s.ipAddr)
+			}
+			if s.remoteAddr != nil {
+				delete(s.ln.peerConns, s.remoteAddr.String())
 			}
 			s.ln.peerMu.Unlock()
 		}
@@ -441,14 +474,6 @@ func (s *packetSubConn) Close() error {
 	return nil
 }
 
-/*
-	func (s *packetSubConn) tryDrainRing() {
-		if s.readMu.TryLock() {
-			s.drainRing()
-			s.readMu.Unlock()
-		}
-	}
-*/
 func (s *packetSubConn) drainRing() {
 	s.readMu.Lock()
 	defer s.readMu.Unlock()

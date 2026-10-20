@@ -787,7 +787,11 @@ func (c *Channel) feedReliablePayload(offset uint64, payload []byte, head *[]byt
 		}
 
 		shouldClose = c.hasFin && c.readOffset >= c.finOffset
-		c.sendAck(c.cumulativeAckLocked())
+		if shouldClose || c.inOrderPackets.Add(1)%2 == 0 {
+			c.sendAck(c.cumulativeAckLocked())
+		} else {
+			c.scheduleDelayedAck(c.cumulativeAckLocked())
+		}
 
 	case offset > c.readOffset:
 		// 3. Out-of-order gap detected: buffer in reorderMap

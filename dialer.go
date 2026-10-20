@@ -18,13 +18,8 @@ import (
 )
 
 const (
-	// DefaultHandshakeTimeout bounds the whole client handshake (write request,
-	// read response). Without it a lost UDP datagram or a silent server hung
-	// Dial forever.
 	DefaultHandshakeTimeout = 5 * time.Second
-
-	// maxUDPPayload is the largest datagram we may receive on a packet conn.
-	maxUDPPayload = 65535
+	maxUDPPayload           = 65535
 )
 
 var (
@@ -41,22 +36,10 @@ var (
 //
 // The zero value is usable.
 type Dialer struct {
-	// Config is the local session config. Window sizes, max frame size and
-	// reliability are overridden by what the listener advertises.
-	Config *Config
-
-	// PrivateKey is the client identity used to sign handshakes. If nil, an
-	// ephemeral Ed25519 key is generated per session. The same key is
-	// required for resumption, which the session remembers internally.
-	PrivateKey ed25519.PrivateKey
-
-	// HandshakeTimeout bounds each handshake. Defaults to DefaultHandshakeTimeout.
+	Config           *Config
+	PrivateKey       ed25519.PrivateKey
 	HandshakeTimeout time.Duration
-
-	// Redial, if set, is used to obtain a fresh transport whenever the current
-	// one breaks; the session is then resumed transparently (connection
-	// migration). Without it, call Session.Resume yourself.
-	Redial func() (net.Conn, error)
+	Redial           func() (net.Conn, error)
 }
 
 // dialer is the per-session client state needed for resumption.
@@ -68,7 +51,7 @@ type dialer struct {
 	sessionID          [32]byte
 	timeout            time.Duration
 	redial             func() (net.Conn, error)
-	mu                 sync.Mutex // serialises resume attempts
+	mu                 sync.Mutex
 	resuming           atomic.Bool
 }
 
@@ -241,21 +224,6 @@ func initiatorExchange(conn net.Conn, timeout time.Duration, sid [32]byte, nonce
 	return resp, nil
 }
 
-// Resume re-attaches a client session to a new transport (for example after
-// the client's IP changed or the TCP connection dropped). The session must
-// have been created by Dial/Dialer and still be within its
-// ConnectionResumeTimeout grace period. Channels, offsets and (with
-// Reliability) unacknowledged data survive the switch.
-//
-// On failure conn is left open; the caller owns it.
-func (s *Session) Resume(conn net.Conn) error {
-	d := s.dialer.Load()
-	if d == nil {
-		return ErrNotResumable
-	}
-	return d.resume(conn)
-}
-
 func (d *dialer) resume(conn net.Conn) error {
 	s := d.session
 	if s.isClosed() {
@@ -341,7 +309,7 @@ func (d *dialer) autoResume() {
 // header afterwards). Here every datagram is read whole and served piecewise.
 type datagramConn struct {
 	net.Conn
-	pc net.PacketConn // non-nil when ReadFrom is available (strips IPv4 header on raw IP)
+	isRawIP bool
 
 	readMu sync.Mutex
 	buf    []byte
@@ -368,11 +336,12 @@ func wrapTransport(conn net.Conn) net.Conn {
 	if la == nil || !isDatagramNetwork(la.Network()) {
 		return conn
 	}
-	dc := &datagramConn{Conn: conn, buf: make([]byte, maxUDPPayload)}
-	if pc, ok := conn.(net.PacketConn); ok {
-		dc.pc = pc
+	dc := &datagramConn{
+		Conn:    conn,
+		buf:     make([]byte, maxUDPPayload),
+		isRawIP: strings.HasPrefix(la.Network(), "ip"),
 	}
-	dc.maxOut.Store(1500 - 28) // conservative until the handshake tells us more
+	dc.maxOut.Store(1500 - 28)
 	return dc
 }
 
@@ -397,6 +366,7 @@ func (c *datagramConn) Write(b []byte) (int, error) {
 
 func (c *datagramConn) maxDatagramSize() int { return int(c.maxOut.Load()) }
 
+// Read uses 0-alloc Conn.Read() and strips raw IPv4 headers in-place.
 func (c *datagramConn) Read(b []byte) (int, error) {
 	if len(b) == 0 {
 		return 0, nil
@@ -405,20 +375,24 @@ func (c *datagramConn) Read(b []byte) (int, error) {
 	defer c.readMu.Unlock()
 
 	for c.r == c.w {
-		var n int
-		var err error
-		if c.pc != nil {
-			n, _, err = c.pc.ReadFrom(c.buf)
-		} else {
-			n, err = c.Conn.Read(c.buf)
-		}
+		n, err := c.Conn.Read(c.buf)
 		if err != nil {
 			if isTransientDatagramErr(err) {
-				continue // e.g. ICMP unreachable reported on a connected socket
+				continue
 			}
 			return 0, err
 		}
-		c.r, c.w = 0, n
+
+		start := 0
+		// Strip raw IPv4 header in-place if delivered by the kernel
+		if c.isRawIP && n >= 20 && (c.buf[0]>>4) == 4 {
+			ihl := int(c.buf[0]&0x0F) * 4
+			if ihl >= 20 && ihl <= n {
+				start = ihl
+			}
+		}
+
+		c.r, c.w = start, n
 	}
 	n := copy(b, c.buf[c.r:c.w])
 	c.r += n
@@ -437,7 +411,7 @@ func isTransientDatagramErr(err error) bool {
 	switch errno {
 	case syscall.ENOBUFS, syscall.EAGAIN, syscall.ECONNREFUSED, syscall.EHOSTUNREACH,
 		syscall.ENETUNREACH, syscall.EHOSTDOWN, syscall.ENETDOWN, syscall.EMSGSIZE,
-		syscall.ENOPROTOOPT: // ICMP protocol unreachable (raw IP)
+		syscall.ENOPROTOOPT:
 		return true
 	}
 	return false

@@ -9,6 +9,7 @@ import (
 	"errors"
 	"io"
 	"net"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,31 +44,31 @@ const (
 
 // Listener implements net.Listener interface for both stream (TCP) and packet (UDP/IP) transports
 type Listener struct {
-	//secp256k1 public key of the listener, used for session resumption and authentication
-	//Address string // optional: if empty, Addr() returns the underlying listener's address
-
-	ln    net.Listener
-	pconn net.PacketConn // Set if created via ListenPacket
+	ln      net.Listener
+	pconn   net.PacketConn // Set if created via ListenPacket
+	udpConn *net.UDPConn   // Cached for 0-alloc ReadFromUDPAddrPort
 
 	sessionConfig *Config
 
-	handshakeTimeout          time.Duration //default 10s
+	handshakeTimeout          time.Duration
 	AllowConnectionResumption bool
 	ConnectionResumeTimeout   time.Duration
-	TransparentResumption     bool // If true, resumed sessions continue in-place without returning to Accept()
+	TransparentResumption     bool
 
-	sessions map[string]*activeSession // map of sessionID to activeSession
+	sessions map[string]*activeSession
 	mu       sync.RWMutex
 
 	// Datagram / PacketConn Management
-	peerMu     sync.RWMutex
-	peerConns  map[string]*packetSubConn // remoteAddr.String() -> *packetSubConn
-	acceptChan chan *Session
+	peerMu       sync.RWMutex
+	peerConns    map[string]*packetSubConn
+	peerUDPConns map[netip.AddrPort]*packetSubConn // 0-alloc lookup for UDP
+	peerIPConns  map[netip.Addr]*packetSubConn     // 0-alloc lookup for Raw IP
+	acceptChan   chan *Session
 
-	mtu int // max datagram size (packet listeners only)
+	mtu int
 
 	acceptOnce sync.Once
-	acceptErr  atomic.Value // error from the underlying stream listener
+	acceptErr  atomic.Value
 	acceptDone chan struct{}
 
 	die       chan struct{}

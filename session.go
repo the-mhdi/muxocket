@@ -1177,6 +1177,20 @@ func (s *Session) RemoteAddr() net.Addr {
 	return nil
 }
 
+// Resume re-attaches a client session to a new transport (for example after
+// the client's IP changed or the TCP connection dropped). The session must
+// have been created by Dial/Dialer and still be within its
+// ConnectionResumeTimeout grace period. Channels, offsets and (with
+// Reliability) unacknowledged data survive the switch.
+//
+// On failure conn is left open; the caller owns it.
+func (s *Session) Resume(conn net.Conn) error {
+	d := s.dialer.Load()
+	if d == nil {
+		return ErrNotResumable
+	}
+	return d.resume(conn)
+}
 func (s *Session) Close() error {
 	s.closeOnce.Do(func() {
 		s.hooksMu.Lock()
