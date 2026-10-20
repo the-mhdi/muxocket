@@ -14,6 +14,9 @@ var (
 
 const DefaultChannelCloseTimeout = 4 * time.Second
 
+// maxRetainedUnacked caps the unacked backing array kept across drains.
+const maxRetainedUnacked = 1024
+
 const (
 	stateIdle    uint32 = 0
 	stateWaiting uint32 = 1
@@ -72,8 +75,10 @@ type Channel struct {
 	inARQ       bool // registered in session.arqSet; guarded by unackedMu
 
 	// Coalesced ACK state (see sendAck / writeLoop)
-	ackOffset  atomic.Uint64
-	ackPending atomic.Bool
+	ackOffset      atomic.Uint64
+	ackPending     atomic.Bool
+	ackTimer       atomic.Pointer[time.Timer]
+	inOrderPackets atomic.Uint32
 }
 
 // maxReorderBytes bounds out-of-order buffering per channel. A peer could
@@ -505,19 +510,16 @@ func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
 	c.reorderMu.Lock()
 	switch {
 	case c.reorderMap == nil:
-		// Channel torn down; just drop it.
 		_ = defaultAllocator.Put(pBuf)
 
 	case offset+uint64(length) <= c.readOffset:
-		// 1. Packet already acknowledged and received
+		// 1. Packet already acknowledged and received: duplicate ACK immediately
 		_ = defaultAllocator.Put(pBuf)
 		c.sendAck(c.cumulativeAckLocked())
 
 	case offset == c.readOffset:
 		// 2. Next contiguous in-order slice
 		if err := c.feed(pBuf); err != nil {
-			// Locally closed: discard but still advance and ACK, so the
-			// sender doesn't retransmit into the void until MaxRetransmit.
 			_ = defaultAllocator.Put(pBuf)
 			c.creditSession(length)
 			c.resetPeer(false)
@@ -525,6 +527,7 @@ func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
 		c.readOffset += uint64(length)
 
 		// Drain contiguous backlog
+		drainedBacklog := len(c.reorderMap) > 0
 		for len(c.reorderMap) > 0 {
 			nextFrame, exists := c.reorderMap[c.readOffset]
 			if !exists {
@@ -538,14 +541,26 @@ func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
 			c.readOffset += uint64(nextFrame.length)
 		}
 
-		// If FIN was previously received and all gaps are now filled, close the stream
 		shouldClose = c.hasFin && c.readOffset >= c.finOffset
-		c.sendAck(c.cumulativeAckLocked())
+		ackTarget := c.cumulativeAckLocked()
+
+		// Delayed ACK Rules:
+		// - If we filled a gap and drained backlog: ACK immediately.
+		// - If this finishes the stream (FIN): ACK immediately.
+		// - If we have accumulated >= 2 in-order packets: ACK immediately.
+		// - Otherwise: schedule a delayed ACK (flushes within AckInterval or on 2nd packet).
+		if shouldClose || drainedBacklog || c.inOrderPackets.Add(1) >= 2 {
+			c.inOrderPackets.Store(0)
+			c.sendAck(ackTarget)
+		} else {
+			c.scheduleDelayedAck(ackTarget)
+		}
 
 	case offset > c.readOffset:
-		// 3. Out-of-order slice (gap detected): buffer and issue duplicate ACK
+		// 3. Out-of-order gap detected: MUST ACK immediately for fast retransmit!
+		c.inOrderPackets.Store(0)
 		if offset-c.readOffset > c.maxReorderBytes() {
-			_ = defaultAllocator.Put(pBuf) // beyond any legal window
+			_ = defaultAllocator.Put(pBuf)
 		} else if _, exists := c.reorderMap[offset]; !exists {
 			c.reorderMap[offset] = &reorderFrame{
 				pBuf:   pBuf,
@@ -558,9 +573,6 @@ func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
 		c.sendAck(c.cumulativeAckLocked())
 
 	default:
-		// Partially overlapping retransmission (offset < readOffset < end).
-		// Frames are never re-chunked, so this only happens with a broken
-		// peer; drop it and re-ACK.
 		_ = defaultAllocator.Put(pBuf)
 		c.sendAck(c.cumulativeAckLocked())
 	}
@@ -569,6 +581,7 @@ func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
 	if shouldClose {
 		c.remoteClose()
 	}
+
 }
 
 // cumulativeAckLocked returns the ACK to send (reorderMu held). Once all data
@@ -593,9 +606,14 @@ func (c *Channel) creditSession(n uint32) {
 // sendAck publishes the latest cumulative offset and enqueues at most one ACK
 // frame per channel; the writer reads the newest offset at flush time.
 func (c *Channel) sendAck(cumulativeOffset uint64) {
+	// Stop any pending delayed ACK timer since we are sending an ACK now
+	if t := c.ackTimer.Swap(nil); t != nil {
+		t.Stop()
+	}
+
 	c.ackOffset.Store(cumulativeOffset)
 	if !c.ackPending.CompareAndSwap(false, true) {
-		return // an ACK is already queued; it will carry the new offset
+		return // an ACK is already queued; it will pick up the new offset
 	}
 	frame := writeFrame{
 		flag:  FLG_ACK,
@@ -607,8 +625,34 @@ func (c *Channel) sendAck(cumulativeOffset uint64) {
 	}
 }
 
-// maxRetainedUnacked caps the unacked backing array kept across drains.
-const maxRetainedUnacked = 1024
+// scheduleDelayedAck delays the ACK for in-order streams so 2 packets
+// can be acknowledged at once, while ensuring idle streams flush within AckInterval.
+func (c *Channel) scheduleDelayedAck(offset uint64) {
+	c.ackOffset.Store(offset)
+	if c.ackPending.Load() {
+		return // already an ACK queued in writer
+	}
+
+	interval := c.session.config.AckInterval
+	if interval <= 0 {
+		c.sendAck(offset)
+		return
+	}
+
+	// If a timer is already running, let it fire
+	if c.ackTimer.Load() != nil {
+		return
+	}
+
+	t := time.AfterFunc(interval, func() {
+		c.ackTimer.Store(nil)
+		c.reorderMu.Lock()
+		curOffset := c.cumulativeAckLocked()
+		c.reorderMu.Unlock()
+		c.sendAck(curOffset)
+	})
+	c.ackTimer.Store(t)
+}
 
 // onAck releases acknowledged chunks back to the allocator.
 func (c *Channel) onAck(ackOffset uint64) {
@@ -924,6 +968,10 @@ func (c *Channel) Label() string {
 }
 
 func (c *Channel) cleanupReliability() {
+	if t := c.ackTimer.Swap(nil); t != nil {
+		t.Stop()
+	}
+
 	c.unackedMu.Lock()
 	unacked := c.unacked
 	c.unacked = nil

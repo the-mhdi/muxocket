@@ -545,9 +545,10 @@ func BenchmarkThroughput_RawIP(b *testing.B) {
 		b.Run(fmt.Sprintf("%dKB", sz/1024), func(b *testing.B) {
 			cfg := DefaultConfig()
 			cfg.Reliability = true
+			cfg.MaxWriteBufferSize = 32
 			cfg.RetransmitTimeout = 40 * time.Millisecond
 
-			_, srv, cli, cleanup := createIPSessionPair(b, 65535, cfg, "127.0.0.2")
+			_, srv, cli, cleanup := createIPSessionPair(b, 32*1024, cfg, "127.0.0.2")
 			defer cleanup()
 
 			ch1, _ := cli.OpenChannel("ipbnch")

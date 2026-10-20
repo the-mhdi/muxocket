@@ -20,6 +20,10 @@ type StreamFlow struct {
 	threshold   int32
 	updating    atomic.Uint32
 	winNotify   chan struct{}
+
+	// Coalescing state:
+	updPending atomic.Bool
+	unflushed  atomic.Int32
 }
 
 func NewStreamFlow(chID uint32, initialWindow int32, ch *Channel, s *Session) *StreamFlow {
@@ -156,30 +160,27 @@ func (sf *StreamFlow) OnRead(n int) {
 }
 
 func (sf *StreamFlow) flushUpdate() {
-	if !sf.updating.CompareAndSwap(0, 1) {
+	curr := sf.consumed.Swap(0)
+	if curr <= 0 {
 		return
 	}
-	defer sf.updating.Store(0)
+	// Accumulate credits into unflushed
+	sf.unflushed.Add(curr)
 
-	curr := sf.consumed.Load()
-	if curr < sf.threshold {
-		return
-	}
-	delta := sf.consumed.Swap(0)
-	if delta <= 0 {
+	// If a window update frame is already queued in ctrlQueue,
+	// it will atomically pick up the newly accumulated credits at flush time.
+	if !sf.updPending.CompareAndSwap(false, true) {
 		return
 	}
 
 	frame := writeFrame{
-		flag:   FLG_UPD,
-		chID:   sf.chID,
-		length: uint32(delta),
-		pBuf:   nil,
+		flag:       FLG_UPD,
+		chID:       sf.chID,
+		streamFlow: sf,
 	}
 
-	// If control queue was busy, restore delta so credits are NEVER lost!
 	if !sf.session.writeControlFrameNonBlocking(frame) {
-		sf.consumed.Add(delta)
+		sf.updPending.Store(false)
 	}
 }
 
@@ -190,6 +191,10 @@ type SessionFlow struct {
 	threshold   int32
 	updating    atomic.Uint32
 	enabled     bool
+
+	// Coalescing state:
+	updPending atomic.Bool
+	unflushed  atomic.Int32
 }
 
 func NewSessionFlow(initialWindow int32, s *Session) *SessionFlow {
@@ -246,29 +251,23 @@ func (sf *SessionFlow) OnRead(n int32) {
 }
 
 func (sf *SessionFlow) flushUpdate() {
-	if !sf.updating.CompareAndSwap(0, 1) {
+	curr := sf.consumed.Swap(0)
+	if curr <= 0 {
 		return
 	}
-	defer sf.updating.Store(0)
+	sf.unflushed.Add(curr)
 
-	curr := sf.consumed.Load()
-	if curr < sf.threshold {
-		return
-	}
-	delta := sf.consumed.Swap(0)
-	if delta <= 0 {
+	if !sf.updPending.CompareAndSwap(false, true) {
 		return
 	}
 
 	frame := writeFrame{
-		flag:   FLG_UPD,
-		chID:   0,
-		length: uint32(delta),
-		pBuf:   nil,
+		flag:        FLG_UPD,
+		chID:        0,
+		sessionFlow: sf,
 	}
 
-	// If control queue was busy, restore delta so session credits are NEVER lost!
 	if !sf.session.writeControlFrameNonBlocking(frame) {
-		sf.consumed.Add(delta)
+		sf.updPending.Store(false)
 	}
 }

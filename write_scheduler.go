@@ -25,6 +25,10 @@ type writeFrame struct {
 	// ACK per channel instead of N frames (or N goroutines when ctrlQueue is
 	// full).
 	ackCh *Channel
+
+	// Coalescing references:
+	streamFlow  *StreamFlow
+	sessionFlow *SessionFlow
 }
 
 // unackedFrame is shared between the channel's retransmission queue and any
@@ -154,6 +158,71 @@ func releaseFrame(f *writeFrame) {
 	f.pBuf = nil
 	f.ack = nil
 	f.ackCh = nil
+	f.streamFlow = nil
+	f.sessionFlow = nil
+}
+
+func (ws *writeScheduler) compactAndResolveControlFrames(frames []writeFrame) []writeFrame {
+	out := frames[:0]
+
+	for i := range frames {
+		f := &frames[i]
+
+		// 1. Resolve late-bound ACK offset
+		if ch := f.ackCh; ch != nil {
+			ch.ackPending.Store(false)
+			f.offset = ch.ackOffset.Load()
+		}
+
+		// 2. Resolve late-bound Stream Window Update delta
+		if sf := f.streamFlow; sf != nil {
+			delta := sf.unflushed.Swap(0)
+			sf.updPending.Store(false)
+			if delta <= 0 {
+				continue // discard empty update
+			}
+			f.length = uint32(delta)
+		}
+
+		// 3. Resolve late-bound Session Window Update delta
+		if sf := f.sessionFlow; sf != nil {
+			delta := sf.unflushed.Swap(0)
+			sf.updPending.Store(false)
+			if delta <= 0 {
+				continue // discard empty update
+			}
+			f.length = uint32(delta)
+		}
+
+		// 4. In-batch Deduplication
+		merged := false
+		if f.flag == FLG_ACK {
+			// If an earlier ACK for the same channel exists in this batch, keep the newer offset
+			for j := range out {
+				if out[j].flag == FLG_ACK && out[j].chID == f.chID {
+					if f.offset > out[j].offset {
+						out[j].offset = f.offset
+					}
+					merged = true
+					break
+				}
+			}
+		} else if f.flag == FLG_UPD {
+			// If an earlier UPD for the same channel/session exists, combine the credits
+			for j := range out {
+				if out[j].flag == FLG_UPD && out[j].chID == f.chID {
+					out[j].length += f.length
+					merged = true
+					break
+				}
+			}
+		}
+
+		if !merged {
+			out = append(out, *f)
+		}
+	}
+	return out
 }
 
 // batchState holds the writer's reusable scratch arrays.
@@ -169,14 +238,10 @@ type batchState struct {
 
 // writeBatch encodes and writes frames, then releases their buffers.
 func (ws *writeScheduler) writeBatch(b *batchState, writer io.Writer, n int) error {
-	frames := b.frames[:n]
-	// Resolve coalesced ACKs as late as possible so they carry the newest
-	// cumulative offset.
-	for i := range frames {
-		if ch := frames[i].ackCh; ch != nil {
-			ch.ackPending.Store(false)
-			frames[i].offset = ch.ackOffset.Load()
-		}
+	// Compact control frames in-place
+	frames := ws.compactAndResolveControlFrames(b.frames[:n])
+	if len(frames) == 0 {
+		return nil
 	}
 
 	var err error
@@ -196,8 +261,6 @@ func (ws *writeScheduler) writeBatch(b *batchState, writer io.Writer, n int) err
 		b.bufs = bufSlice
 		_, err = b.bufs.WriteTo(writer)
 		b.bufs = nil
-		// net.Buffers.WriteTo consumes the slice; clear stale references so
-		// the backing array doesn't pin payload slabs between batches.
 		for i := range b.raw {
 			b.raw[i] = nil
 		}
