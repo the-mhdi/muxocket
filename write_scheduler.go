@@ -87,9 +87,10 @@ func (f *unackedFrame) release() {
 }
 
 type reorderFrame struct {
-	pBuf   *[]byte
-	offset uint64
-	length uint32
+	payload []byte
+	head    *[]byte
+	offset  uint64
+	length  uint32
 }
 
 // datagramWriter is implemented by message-oriented transports (UDP/IP). The

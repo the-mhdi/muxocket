@@ -44,6 +44,11 @@ const (
 	DEFAULT_MIN_FRAME_LEN        uint32 = 5
 )
 
+const (
+	DefaultSystemPacketReadBuffer  int = 4 * 1024 * 1024
+	DefaultSystemPacketWriteBuffer int = 4 * 1024 * 1024
+)
+
 const MaxBatchFramesInWriter int = 24
 const MaxClosedIDs int = 512 // maximum number of recently closed channel IDs to remember (Reliability only). it is to prevent a malicious peer from sending a lot of late frames to exhaust memory.
 
@@ -126,6 +131,10 @@ type PacketFrame struct {
 	Data       []byte
 }
 
+type packetReader interface {
+	ReadPacket() (pBuf *[]byte, err error)
+}
+
 type Config struct {
 	MaxFrameDataSize uint32
 
@@ -133,6 +142,11 @@ type Config struct {
 	MaxWriteBufferSize   uint32 //over ip or udp or any protocol with low mtus, we better increase this from default of 32 to 128 or higher
 	InitialStreamWindow  uint32
 	InitialSessionWindow uint32
+
+	//only applicable to packet based protocols
+	SystemPacketReadBuffer  int
+	SystemPacketWriteBuffer int
+
 	//DrainChannelAfterClose  bool
 	KeepAlive               bool
 	KeepAliveInterval       time.Duration
@@ -171,6 +185,8 @@ func DefaultConfig() *Config {
 		MaxWriteBufferSize:              32,
 		InitialStreamWindow:             DefaultInitialStreamWindow,
 		InitialSessionWindow:            DefaultInitialSessionWindow,
+		SystemPacketReadBuffer:          DefaultSystemPacketReadBuffer,  // def 4 * 1024 * 1024
+		SystemPacketWriteBuffer:         DefaultSystemPacketWriteBuffer, // def 4 * 1024 * 1024
 		MaxUnknownChannelErrors:         128,
 		KeepAlive:                       true,
 		KeepAliveInterval:               5 * time.Second,
@@ -220,6 +236,13 @@ func NewSessionWithID(conn io.ReadWriteCloser, cfg *Config, id string) *Session 
 		cfg.InitialSessionWindow = DefaultInitialSessionWindow
 	}
 
+	if cfg.SystemPacketReadBuffer == 0 {
+		cfg.SystemPacketReadBuffer = DefaultSystemPacketReadBuffer
+	}
+
+	if cfg.SystemPacketWriteBuffer == 0 {
+		cfg.SystemPacketWriteBuffer = DefaultSystemPacketWriteBuffer
+	}
 	if cfg.RetransmitTimeout == 0 {
 		cfg.RetransmitTimeout = 150 * time.Millisecond
 	}
@@ -516,6 +539,18 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 	s.readerMu.Lock()
 	defer s.readerMu.Unlock()
 
+	// If this is a datagram transport (UDP / Raw IP), use the zero-copy packet path
+	if pr, ok := c.(packetReader); ok {
+		s.datagramReadLoop(c, pr)
+		return
+	}
+
+	// Otherwise, use the streaming loop (for TCP etc)
+	s.streamReadLoop(c)
+
+}
+
+func (s *Session) streamReadLoop(c io.ReadWriteCloser) {
 	// Local header: the old shared s.header field was written by two
 	// goroutines when a resumed readLoop overlapped the dying one.
 	var header [17]byte
@@ -681,6 +716,163 @@ func (s *Session) readLoop(c io.ReadWriteCloser) {
 			// framing is lost.
 			s.handleDisconnect(c)
 			return
+		}
+	}
+}
+
+func (s *Session) datagramReadLoop(c io.ReadWriteCloser, pr packetReader) {
+	for {
+		if s.isClosed() {
+			return
+		}
+
+		pBuf, err := pr.ReadPacket()
+		if err != nil {
+			s.handleDisconnect(c)
+			return
+		}
+		s.rxActivity.Store(true)
+
+		data := *pBuf
+		offsetInPacket := 0
+
+		// A single UDP datagram may contain 1 or more frames
+		for offsetInPacket+17 <= len(data) {
+			hdr := data[offsetInPacket : offsetInPacket+17]
+			dataLength := binary.BigEndian.Uint32(hdr[0:4])
+			flag := hdr[4]
+			channelID := binary.BigEndian.Uint32(hdr[5:9])
+			offset := binary.BigEndian.Uint64(hdr[9:17])
+
+			frameEnd := offsetInPacket + 17 + int(dataLength)
+			if frameEnd > len(data) {
+				// Malformed or truncated packet
+				break
+			}
+
+			switch flag {
+			case FLG_DATA:
+				if dataLength == 0 {
+					offsetInPacket = frameEnd
+					continue
+				}
+
+				payload := data[offsetInPacket+17 : frameEnd]
+
+				ch := s.getChannel(channelID)
+				if ch == nil {
+					s.creditDiscarded(dataLength)
+					offsetInPacket = frameEnd
+					continue
+				}
+
+				// Direct Handoff Condition:
+				// If this DATA frame is the ONLY frame in the datagram, hand off pBuf directly!
+				if offsetInPacket == 0 && frameEnd == len(data) {
+					ch.feedMu.Lock()
+					if s.config.Reliability {
+						ch.feedReliablePayload(offset, payload, pBuf, dataLength)
+					} else {
+						_ = ch.feedPayload(payload, pBuf)
+					}
+					ch.feedMu.Unlock()
+					pBuf = nil // Ownership transferred to channel; do not free here!
+				} else {
+					// Fallback: If multiple frames were bundled in one datagram, allocate a copy
+					// so multiple channels don't race on the same backing slab.
+					pCopy := defaultAllocator.Get(int(dataLength))
+					copy(*pCopy, payload)
+					ch.feedMu.Lock()
+					if s.config.Reliability {
+						ch.feedReliable(offset, pCopy, dataLength)
+					} else {
+						_ = ch.feed(pCopy)
+					}
+					ch.feedMu.Unlock()
+				}
+
+			case FLG_ACK:
+				if s.config.Reliability {
+					if ch := s.getChannel(channelID); ch != nil {
+						ch.onAck(offset)
+					}
+				}
+
+			case FLG_UPD:
+				delta := int32(dataLength)
+				if channelID == 0 {
+					if s.flow != nil {
+						s.flow.AddCredits(delta)
+					}
+				} else if ch := s.getChannel(channelID); ch != nil {
+					ch.flow.AddCredits(delta)
+				}
+
+			case FLG_FIN:
+				ch := s.getChannel(channelID)
+				if ch == nil {
+					s.channelsMu.Lock()
+					if ch = s.channels[channelID]; ch == nil && !s.isClosed() {
+						if !s.recentlyClosedLocked(channelID) {
+							s.stashLocked(channelID, pendingFrame{flag: FLG_FIN, offset: offset})
+						}
+					}
+					s.channelsMu.Unlock()
+				}
+				if ch != nil {
+					ch.feedMu.Lock()
+					if s.config.Reliability {
+						ch.handleFinReliable(offset)
+					} else {
+						ch.remoteClose()
+					}
+					ch.feedMu.Unlock()
+				}
+
+			case FLG_RST:
+				ch := s.getChannel(channelID)
+				if ch == nil {
+					s.channelsMu.Lock()
+					if ch = s.channels[channelID]; ch == nil && !s.isClosed() {
+						if !s.recentlyClosedLocked(channelID) {
+							s.stashLocked(channelID, pendingFrame{flag: FLG_RST, offset: offset})
+						}
+					}
+					s.channelsMu.Unlock()
+				}
+				if ch != nil {
+					ch.peerReset()
+				}
+			case FLG_PING:
+				// Never block the reader on a full control queue: a peer that
+				// isn't reading would otherwise stall our whole receive path.
+				select {
+				case s.writer.ctrlQueue <- writeFrame{flag: FLG_PONG}:
+				default:
+				}
+
+			case FLG_GOAWAY:
+				s.goAwayRecv.Store(true)
+				s.Close()
+				return
+
+			case FLG_PONG, FLG_NOOP:
+				// liveness only (rxActivity already recorded)
+			default:
+				// Unknown flag: we can't know whether a payload follows, so the
+				// framing is lost.
+				s.handleDisconnect(c)
+				return
+			}
+
+			offsetInPacket = frameEnd
+
+		}
+
+		// If pBuf was not handed off to a channel (e.g., pure ACK/UPD datagram or discarded frame),
+		// recycle it back to the allocator immediately.
+		if pBuf != nil {
+			_ = defaultAllocator.Put(pBuf)
 		}
 	}
 }

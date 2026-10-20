@@ -501,47 +501,114 @@ func BenchmarkThroughput_UDP(b *testing.B) {
 	}
 
 	for _, sz := range chunkSizes {
+		sz := sz
 		b.Run(fmt.Sprintf("%dKB", sz/1024), func(b *testing.B) {
 			cfg := DefaultConfig()
 			cfg.Reliability = true
 			cfg.RetransmitTimeout = 40 * time.Millisecond
-			cfg.MaxWriteBufferSize = 128
-			_, srv, cli, cleanup := createUDPSessionPair(b, 65535, cfg)
-			defer cleanup()
+			cfg.MaxWriteBufferSize = 64
+			// Fit in-flight window to kernel buffer capacity
+			cfg.InitialStreamWindow = 512 * 1024
+			cfg.InitialSessionWindow = 1024 * 1024
 
-			ch1, _ := cli.OpenChannel("bench")
-			ch2, _ := srv.OpenChannel("bench")
+			// Server setup
+			pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+			if err != nil {
+				b.Fatalf("ListenPacket failed: %v", err)
+			}
+			// Expand kernel UDP socket buffers
+			if uc, ok := pconn.(*net.UDPConn); ok {
+				_ = uc.SetReadBuffer(4 * 1024 * 1024)
+				_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+			}
+
+			// 65507 is the absolute max IPv4 UDP payload (65535 - 28)
+			const safeUDP_MTU = 1400
+			ln, err := ListenPacket(pconn, safeUDP_MTU, cfg)
+			if err != nil {
+				_ = pconn.Close()
+				b.Fatalf("ListenPacket constructor failed: %v", err)
+			}
+
+			// Client setup
+			cliConn, err := net.Dial("udp", ln.Addr().String())
+			if err != nil {
+				_ = ln.Close()
+				b.Fatalf("Dial UDP failed: %v", err)
+			}
+			if uc, ok := cliConn.(*net.UDPConn); ok {
+				_ = uc.SetReadBuffer(4 * 1024 * 1024)
+				_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+			}
+
+			cli, err := DialConfig(cliConn, cfg)
+			if err != nil {
+				_ = cliConn.Close()
+				_ = ln.Close()
+				b.Fatalf("DialConfig failed: %v", err)
+			}
+
+			srv, err := ln.Accept()
+			if err != nil {
+				_ = cli.Close()
+				_ = cliConn.Close()
+				_ = ln.Close()
+				b.Fatalf("Accept failed: %v", err)
+			}
+
+			defer func() {
+				_ = cli.Close()
+				_ = srv.Close()
+				_ = cliConn.Close()
+				_ = ln.Close()
+			}()
+
+			ch1, err := cli.OpenChannel("bench")
+			if err != nil {
+				b.Fatal(err)
+			}
+			ch2, err := srv.OpenChannel("bench")
+			if err != nil {
+				b.Fatal(err)
+			}
 
 			buf := make([]byte, sz)
-			rand.Read(buf)
+			_, _ = rand.Read(buf)
 
 			b.SetBytes(int64(sz))
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			done := make(chan struct{})
+			done := make(chan error, 1)
 			go func() {
 				recv := make([]byte, sz)
 				for i := 0; i < b.N; i++ {
 					if _, err := io.ReadFull(ch2, recv); err != nil {
+						done <- err
 						return
 					}
 				}
-				close(done)
+				done <- nil
 			}()
 
 			for i := 0; i < b.N; i++ {
 				if _, err := ch1.Write(buf); err != nil {
-					b.Fatalf("Write error: %v", err)
+					b.Fatalf("Write error at iteration %d/%d: %v", i, b.N, err)
 				}
 			}
 
-			<-done
-			ch1.CloseWrite()
-			ch1.Close()
-			ch2.Close()
-			<-ch1.Done()
-			<-ch2.Done()
+			select {
+			case err := <-done:
+				if err != nil {
+					b.Fatalf("Read error: %v", err)
+				}
+			case <-time.After(15 * time.Second):
+				b.Fatal("Benchmark deadlock: receiver timed out")
+			}
+
+			b.StopTimer()
+			_ = ch1.Close()
+			_ = ch2.Close()
 		})
 	}
 }
@@ -550,76 +617,223 @@ func BenchmarkThroughput_UDP(b *testing.B) {
 func BenchmarkThroughput_UDP_MultiChannel(b *testing.B) {
 	cfg := DefaultConfig()
 	cfg.Reliability = true
-
-	_, srv, cli, cleanup := createUDPSessionPair(b, 65535, cfg)
-	defer cleanup()
+	cfg.RetransmitTimeout = 50 * time.Millisecond
+	cfg.MaxWriteBufferSize = 256
+	// Expand session window so 8 concurrent channels don't starve each other
+	cfg.InitialStreamWindow = 1 * 1024 * 1024  // 1 MB per channel
+	cfg.InitialSessionWindow = 8 * 1024 * 1024 // 8 MB session total
 
 	const numChannels = 8
-	const chunkSize = 16 * 1024
-	buf := make([]byte, chunkSize)
-	rand.Read(buf)
+	const chunkSize = 4 * 1024
+	//const safeUDP_MTU = 32000 // Max valid IPv4 UDP payload (65535 - 28)
+
+	// 1. Setup Server with expanded socket buffers
+	pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("ListenPacket failed: %v", err)
+	}
+	if uc, ok := pconn.(*net.UDPConn); ok {
+		_ = uc.SetReadBuffer(4 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+	}
+
+	ln, err := ListenPacket(pconn, 1400, cfg)
+	if err != nil {
+		_ = pconn.Close()
+		b.Fatalf("ListenPacket constructor failed: %v", err)
+	}
+
+	// 2. Setup Client with expanded socket buffers
+	cliConn, err := net.Dial("udp", ln.Addr().String())
+	if err != nil {
+		_ = ln.Close()
+		b.Fatalf("Dial UDP failed: %v", err)
+	}
+	if uc, ok := cliConn.(*net.UDPConn); ok {
+		_ = uc.SetReadBuffer(4 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+	}
+
+	cli, err := DialConfig(cliConn, cfg)
+	if err != nil {
+		_ = cliConn.Close()
+		_ = ln.Close()
+		b.Fatalf("DialConfig failed: %v", err)
+	}
+
+	srv, err := ln.Accept()
+	if err != nil {
+		_ = cli.Close()
+		_ = cliConn.Close()
+		_ = ln.Close()
+		b.Fatalf("Accept failed: %v", err)
+	}
+
+	defer func() {
+		_ = cli.Close()
+		_ = srv.Close()
+		_ = cliConn.Close()
+		_ = ln.Close()
+	}()
 
 	var cliChans [numChannels]*Channel
 	var srvChans [numChannels]*Channel
 
 	for i := 0; i < numChannels; i++ {
 		lbl := fmt.Sprintf("u%02d", i)
-		cliChans[i], _ = cli.OpenChannel(lbl)
-		srvChans[i], _ = srv.OpenChannel(lbl)
+		cliChans[i], err = cli.OpenChannel(lbl)
+		if err != nil {
+			b.Fatalf("client OpenChannel %s failed: %v", lbl, err)
+		}
+		srvChans[i], err = srv.OpenChannel(lbl)
+		if err != nil {
+			b.Fatalf("server OpenChannel %s failed: %v", lbl, err)
+		}
 	}
+
+	buf := make([]byte, chunkSize)
+	_, _ = rand.Read(buf)
 
 	b.SetBytes(int64(chunkSize * numChannels))
 	b.ReportAllocs()
 	b.ResetTimer()
 
-	var wg sync.WaitGroup
-	wg.Add(numChannels)
+	errChan := make(chan error, numChannels*2)
+	var consumerWg sync.WaitGroup
+	consumerWg.Add(numChannels)
 
-	// Consumers
+	// 8 Concurrent Consumers
 	for i := 0; i < numChannels; i++ {
-		go func(c *Channel) {
-			defer wg.Done()
+		go func(c *Channel, id int) {
+			defer consumerWg.Done()
 			recv := make([]byte, chunkSize)
 			for j := 0; j < b.N; j++ {
 				if _, err := io.ReadFull(c, recv); err != nil {
+					errChan <- fmt.Errorf("consumer %d read error at %d/%d: %w", id, j, b.N, err)
 					return
 				}
 			}
-		}(srvChans[i])
+		}(srvChans[i], i)
 	}
 
-	// Producers
-	for j := 0; j < b.N; j++ {
-		for i := 0; i < numChannels; i++ {
-			if _, err := cliChans[i].Write(buf); err != nil {
-				b.Fatalf("Write error: %v", err)
+	// 8 Concurrent Producers (Eliminates single-thread lockstep deadlock)
+	var producerWg sync.WaitGroup
+	producerWg.Add(numChannels)
+	for i := 0; i < numChannels; i++ {
+		go func(c *Channel, id int) {
+			defer producerWg.Done()
+			for j := 0; j < b.N; j++ {
+				if _, err := c.Write(buf); err != nil {
+					errChan <- fmt.Errorf("producer %d write error at %d/%d: %w", id, j, b.N, err)
+					return
+				}
 			}
-		}
+		}(cliChans[i], i)
 	}
 
-	wg.Wait()
+	// Wait for all producers to finish writing
+	producerWg.Wait()
+
+	// Wait for all consumers with a timeout guard
+	consumersDone := make(chan struct{})
+	go func() {
+		consumerWg.Wait()
+		close(consumersDone)
+	}()
+
+	select {
+	case err := <-errChan:
+		b.Fatal(err)
+	case <-consumersDone:
+		// Success
+	case <-time.After(20 * time.Second):
+		b.Fatal("Benchmark deadlock: timed out waiting for multi-channel consumers")
+	}
+
+	b.StopTimer()
+	for i := 0; i < numChannels; i++ {
+		_ = cliChans[i].Close()
+		_ = srvChans[i].Close()
+	}
 }
 
 // BenchmarkLatency_UDP_PingPong measures RTT framing and dispatch latency over UDP.
 func BenchmarkLatency_UDP_PingPong(b *testing.B) {
 	cfg := DefaultConfig()
 	cfg.Reliability = true
+	// 1. Critical for ping-pong: Fast RTO and NO delayed ACK stall
+	cfg.RetransmitTimeout = 20 * time.Millisecond
+	cfg.AckInterval = 0 // Immediate ACK: never delay ACKs when waiting for single-packet responses
 
-	_, srv, cli, cleanup := createUDPSessionPair(b, 1400, cfg)
-	defer cleanup()
+	// 2. Setup Server UDP Socket with expanded buffers
+	pconn, err := net.ListenPacket("udp", "127.0.0.1:0")
+	if err != nil {
+		b.Fatalf("ListenPacket failed: %v", err)
+	}
+	if uc, ok := pconn.(*net.UDPConn); ok {
+		_ = uc.SetReadBuffer(4 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+	}
 
-	ch1, _ := cli.OpenChannel("ping")
-	ch2, _ := srv.OpenChannel("ping")
+	ln, err := ListenPacket(pconn, 1400, cfg)
+	if err != nil {
+		_ = pconn.Close()
+		b.Fatalf("ListenPacket constructor failed: %v", err)
+	}
+
+	// 3. Setup Client UDP Socket with expanded buffers
+	cliConn, err := net.Dial("udp", ln.Addr().String())
+	if err != nil {
+		_ = ln.Close()
+		b.Fatalf("Dial UDP failed: %v", err)
+	}
+	if uc, ok := cliConn.(*net.UDPConn); ok {
+		_ = uc.SetReadBuffer(4 * 1024 * 1024)
+		_ = uc.SetWriteBuffer(4 * 1024 * 1024)
+	}
+
+	cli, err := DialConfig(cliConn, cfg)
+	if err != nil {
+		_ = cliConn.Close()
+		_ = ln.Close()
+		b.Fatalf("DialConfig failed: %v", err)
+	}
+
+	srv, err := ln.Accept()
+	if err != nil {
+		_ = cli.Close()
+		_ = cliConn.Close()
+		_ = ln.Close()
+		b.Fatalf("Accept failed: %v", err)
+	}
+
+	defer func() {
+		_ = cli.Close()
+		_ = srv.Close()
+		_ = cliConn.Close()
+		_ = ln.Close()
+	}()
+
+	ch1, err := cli.OpenChannel("ping")
+	if err != nil {
+		b.Fatal(err)
+	}
+	ch2, err := srv.OpenChannel("ping")
+	if err != nil {
+		b.Fatal(err)
+	}
 
 	msg := []byte("ping")
 	recv := make([]byte, len(msg))
 
-	// Echo server
+	echoDone := make(chan struct{})
+	// Echo server goroutine
 	go func() {
+		defer close(echoDone)
 		echoBuf := make([]byte, len(msg))
 		for {
 			if _, err := io.ReadFull(ch2, echoBuf); err != nil {
-				return
+				return // clean exit when ch2 or session closes
 			}
 			if _, err := ch2.Write(echoBuf); err != nil {
 				return
@@ -632,12 +846,19 @@ func BenchmarkLatency_UDP_PingPong(b *testing.B) {
 
 	for i := 0; i < b.N; i++ {
 		if _, err := ch1.Write(msg); err != nil {
-			b.Fatal(err)
+			b.Fatalf("Write error at iteration %d/%d: %v", i, b.N, err)
 		}
 		if _, err := io.ReadFull(ch1, recv); err != nil {
-			b.Fatal(err)
+			b.Fatalf("ReadFull error at iteration %d/%d: %v", i, b.N, err)
 		}
 	}
+
+	b.StopTimer()
+
+	// Clean channel closure to terminate echo goroutine cleanly
+	_ = ch1.Close()
+	_ = ch2.Close()
+	<-echoDone
 }
 
 // BenchmarkPacketSubConn_ReadWrite tests virtual datagram queue throughput directly.

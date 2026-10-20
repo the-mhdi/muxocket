@@ -55,7 +55,6 @@ func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Liste
 	if packetConn == nil {
 		return nil, errors.New("packetConn cannot be nil")
 	}
-
 	if MTU < 64 || MTU > 65535 || MTU > MaxAllocSize {
 		return nil, errors.New("MTU must be between 64 and 65535")
 	}
@@ -73,6 +72,39 @@ func ListenPacket(packetConn net.PacketConn, MTU int, config ...*Config) (*Liste
 	// handshake, so both directions honour it.
 	if maxData := uint32(MTU - 17); cfg.MaxFrameDataSize == 0 || cfg.MaxFrameDataSize > maxData {
 		cfg.MaxFrameDataSize = maxData
+	}
+
+	if ipConn, ok := packetConn.(*net.IPConn); ok {
+		err := ipConn.SetReadBuffer(cfg.SystemPacketReadBuffer)
+		if err != nil {
+			return nil, err
+		}
+		err = ipConn.SetWriteBuffer(cfg.SystemPacketWriteBuffer)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if ipConn, ok := packetConn.(*net.UDPConn); ok {
+		err := ipConn.SetReadBuffer(cfg.SystemPacketReadBuffer)
+		if err != nil {
+			return nil, err
+		}
+		err = ipConn.SetWriteBuffer(cfg.SystemPacketWriteBuffer)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if ugConn, ok := packetConn.(*net.UnixConn); ok {
+		err := ugConn.SetReadBuffer(cfg.SystemPacketReadBuffer)
+		if err != nil {
+			return nil, err
+		}
+		err = ugConn.SetWriteBuffer(cfg.SystemPacketWriteBuffer)
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	ln := &Listener{
@@ -304,6 +336,33 @@ func (s *packetSubConn) Read(b []byte) (int, error) {
 			s.waitState.Store(stateIdle)
 		}
 
+	}
+}
+func (s *packetSubConn) ReadPacket() (*[]byte, error) {
+	if s.closed.Load() || s.ln.closed.Load() {
+		return nil, io.ErrClosedPipe
+	}
+
+	s.readMu.Lock()
+	defer s.readMu.Unlock()
+
+	for {
+		_, head, ok := s.queue.Pop()
+		if ok && head != nil {
+			return head, nil
+		}
+
+		if s.closed.Load() || s.ln.closed.Load() {
+			return nil, io.ErrClosedPipe
+		}
+
+		s.waitState.Store(stateWaiting)
+		select {
+		case <-s.die:
+			return nil, io.ErrClosedPipe
+		case <-s.notify:
+		}
+		s.waitState.Store(stateIdle)
 	}
 }
 

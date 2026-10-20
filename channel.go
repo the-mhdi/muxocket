@@ -504,84 +504,10 @@ func (c *Channel) WriteTo(w io.Writer) (int64, error) {
 //     panicked with "assignment to entry in nil map".
 //   - buffers rejected by feed() (closed channel) were leaked.
 //   - reorderMap was unbounded.
+//
+// feedReliable forwards to feedReliablePayload so there is no duplicate locking logic.
 func (c *Channel) feedReliable(offset uint64, pBuf *[]byte, length uint32) {
-	shouldClose := false
-
-	c.reorderMu.Lock()
-	switch {
-	case c.reorderMap == nil:
-		_ = defaultAllocator.Put(pBuf)
-
-	case offset+uint64(length) <= c.readOffset:
-		// 1. Packet already acknowledged and received: duplicate ACK immediately
-		_ = defaultAllocator.Put(pBuf)
-		c.sendAck(c.cumulativeAckLocked())
-
-	case offset == c.readOffset:
-		// 2. Next contiguous in-order slice
-		if err := c.feed(pBuf); err != nil {
-			_ = defaultAllocator.Put(pBuf)
-			c.creditSession(length)
-			c.resetPeer(false)
-		}
-		c.readOffset += uint64(length)
-
-		// Drain contiguous backlog
-		drainedBacklog := len(c.reorderMap) > 0
-		for len(c.reorderMap) > 0 {
-			nextFrame, exists := c.reorderMap[c.readOffset]
-			if !exists {
-				break
-			}
-			delete(c.reorderMap, c.readOffset)
-			if err := c.feed(nextFrame.pBuf); err != nil {
-				_ = defaultAllocator.Put(nextFrame.pBuf)
-				c.creditSession(nextFrame.length)
-			}
-			c.readOffset += uint64(nextFrame.length)
-		}
-
-		shouldClose = c.hasFin && c.readOffset >= c.finOffset
-		ackTarget := c.cumulativeAckLocked()
-
-		// Delayed ACK Rules:
-		// - If we filled a gap and drained backlog: ACK immediately.
-		// - If this finishes the stream (FIN): ACK immediately.
-		// - If we have accumulated >= 2 in-order packets: ACK immediately.
-		// - Otherwise: schedule a delayed ACK (flushes within AckInterval or on 2nd packet).
-		if shouldClose || drainedBacklog || c.inOrderPackets.Add(1) >= 2 {
-			c.inOrderPackets.Store(0)
-			c.sendAck(ackTarget)
-		} else {
-			c.scheduleDelayedAck(ackTarget)
-		}
-
-	case offset > c.readOffset:
-		// 3. Out-of-order gap detected: MUST ACK immediately for fast retransmit!
-		c.inOrderPackets.Store(0)
-		if offset-c.readOffset > c.maxReorderBytes() {
-			_ = defaultAllocator.Put(pBuf)
-		} else if _, exists := c.reorderMap[offset]; !exists {
-			c.reorderMap[offset] = &reorderFrame{
-				pBuf:   pBuf,
-				offset: offset,
-				length: length,
-			}
-		} else {
-			_ = defaultAllocator.Put(pBuf)
-		}
-		c.sendAck(c.cumulativeAckLocked())
-
-	default:
-		_ = defaultAllocator.Put(pBuf)
-		c.sendAck(c.cumulativeAckLocked())
-	}
-	c.reorderMu.Unlock()
-
-	if shouldClose {
-		c.remoteClose()
-	}
-
+	c.feedReliablePayload(offset, (*pBuf)[:length], pBuf, length)
 }
 
 // cumulativeAckLocked returns the ACK to send (reorderMu held). Once all data
@@ -788,6 +714,100 @@ func (c *Channel) feed(buffer *[]byte) error {
 	}
 	return nil
 }
+func (c *Channel) feedPayload(payload []byte, head *[]byte) error {
+	if c.closed.Load() || c.session.isClosed() {
+		if c.closed.Load() && !c.session.config.Reliability {
+			c.resetPeer(false)
+		}
+		if head != nil {
+			_ = defaultAllocator.Put(head)
+		}
+		return io.ErrClosedPipe
+	}
+
+	c.ring.Push(payload, head)
+
+	if c.waitState.Load() == stateWaiting {
+		c.wakeReader()
+	}
+	return nil
+}
+
+func (c *Channel) feedReliablePayload(offset uint64, payload []byte, head *[]byte, length uint32) {
+	shouldClose := false
+
+	c.reorderMu.Lock()
+	switch {
+	case c.reorderMap == nil:
+		// Channel torn down; release buffer back to pool
+		if head != nil {
+			_ = defaultAllocator.Put(head)
+		}
+
+	case offset+uint64(length) <= c.readOffset:
+		// 1. Packet already acknowledged and received: discard duplicate and re-ACK
+		if head != nil {
+			_ = defaultAllocator.Put(head)
+		}
+		c.sendAck(c.cumulativeAckLocked())
+
+	case offset == c.readOffset:
+		// 2. Next contiguous in-order slice
+		if err := c.feedPayload(payload, head); err != nil {
+			c.creditSession(length)
+			c.resetPeer(false)
+		}
+		c.readOffset += uint64(length)
+
+		// Drain contiguous backlog from reorderMap
+		for len(c.reorderMap) > 0 {
+			nextFrame, exists := c.reorderMap[c.readOffset]
+			if !exists {
+				break
+			}
+			delete(c.reorderMap, c.readOffset)
+			if err := c.feedPayload(nextFrame.payload, nextFrame.head); err != nil {
+				c.creditSession(nextFrame.length)
+			}
+			c.readOffset += uint64(nextFrame.length)
+		}
+
+		shouldClose = c.hasFin && c.readOffset >= c.finOffset
+		c.sendAck(c.cumulativeAckLocked())
+
+	case offset > c.readOffset:
+		// 3. Out-of-order gap detected: buffer in reorderMap
+		if offset-c.readOffset > c.maxReorderBytes() {
+			if head != nil {
+				_ = defaultAllocator.Put(head) // exceeds legal window limit
+			}
+		} else if _, exists := c.reorderMap[offset]; !exists {
+			c.reorderMap[offset] = &reorderFrame{
+				payload: payload,
+				head:    head,
+				offset:  offset,
+				length:  length,
+			}
+		} else {
+			if head != nil {
+				_ = defaultAllocator.Put(head) // duplicate out-of-order frame
+			}
+		}
+		c.sendAck(c.cumulativeAckLocked())
+
+	default:
+		// Partially overlapping retransmission
+		if head != nil {
+			_ = defaultAllocator.Put(head)
+		}
+		c.sendAck(c.cumulativeAckLocked())
+	}
+	c.reorderMu.Unlock()
+
+	if shouldClose {
+		c.remoteClose()
+	}
+}
 
 func (c *Channel) wakeReader() {
 	select {
@@ -968,10 +988,6 @@ func (c *Channel) Label() string {
 }
 
 func (c *Channel) cleanupReliability() {
-	if t := c.ackTimer.Swap(nil); t != nil {
-		t.Stop()
-	}
-
 	c.unackedMu.Lock()
 	unacked := c.unacked
 	c.unacked = nil
@@ -981,14 +997,14 @@ func (c *Channel) cleanupReliability() {
 	}
 	c.unackedMu.Unlock()
 	for _, f := range unacked {
-		f.release() // frames still queued in the writer keep their own ref
+		f.release()
 	}
 
 	c.reorderMu.Lock()
 	for _, f := range c.reorderMap {
-		if f.pBuf != nil {
-			defaultAllocator.Put(f.pBuf)
-			f.pBuf = nil
+		if f.head != nil {
+			defaultAllocator.Put(f.head)
+			f.head = nil
 		}
 	}
 	c.reorderMap = nil

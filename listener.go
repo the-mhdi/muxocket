@@ -43,6 +43,9 @@ const (
 
 // Listener implements net.Listener interface for both stream (TCP) and packet (UDP/IP) transports
 type Listener struct {
+	//secp256k1 public key of the listener, used for session resumption and authentication
+	//Address string // optional: if empty, Addr() returns the underlying listener's address
+
 	ln    net.Listener
 	pconn net.PacketConn // Set if created via ListenPacket
 
@@ -60,7 +63,8 @@ type Listener struct {
 	peerMu     sync.RWMutex
 	peerConns  map[string]*packetSubConn // remoteAddr.String() -> *packetSubConn
 	acceptChan chan *Session
-	mtu        int // max datagram size (packet listeners only)
+
+	mtu int // max datagram size (packet listeners only)
 
 	acceptOnce sync.Once
 	acceptErr  atomic.Value // error from the underlying stream listener

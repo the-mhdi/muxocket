@@ -6,8 +6,8 @@ import (
 )
 
 const (
-	DefaultInitialStreamWindow  uint32 = 2 * 1024 * 1024 // 2 MB per channel
-	DefaultInitialSessionWindow uint32 = 4 * 1024 * 1024 // 4 MB per session
+	DefaultInitialStreamWindow  uint32 = 1 * 1024 * 1024 // 2 MB per channel
+	DefaultInitialSessionWindow uint32 = 8 * 1024 * 1024 // 4 MB per session
 	DefaultWindowUpdateRatio    uint32 = 4               // Replenish at 1/4 window consumed
 )
 

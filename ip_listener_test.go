@@ -541,18 +541,78 @@ func BenchmarkThroughput_RawIP(b *testing.B) {
 		64 * 1024,
 	}
 
-	for _, sz := range chunkSizes {
+	for idx, sz := range chunkSizes {
+		sz := sz
+		clientIP := fmt.Sprintf("127.0.0.%d", idx+2) // 127.0.0.2, 127.0.0.3, ...
+
 		b.Run(fmt.Sprintf("%dKB", sz/1024), func(b *testing.B) {
 			cfg := DefaultConfig()
 			cfg.Reliability = true
-			cfg.MaxWriteBufferSize = 32
-			cfg.RetransmitTimeout = 40 * time.Millisecond
+			cfg.MaxWriteBufferSize = 512
+			cfg.RetransmitTimeout = 50 * time.Millisecond
+			// Limit in-flight window so it doesn't overrun raw socket queues
+			cfg.InitialStreamWindow = 512 * 1024
+			cfg.InitialSessionWindow = 5 * 1024 * 1024
 
-			_, srv, cli, cleanup := createIPSessionPair(b, 32*1024, cfg, "127.0.0.2")
-			defer cleanup()
+			// Server setup
+			pconn, err := net.ListenPacket(testIPProtocol, "127.0.0.1")
+			if err != nil {
+				b.Fatalf("ListenPacket failed: %v", err)
+			}
 
-			ch1, _ := cli.OpenChannel("ipbnch")
-			ch2, _ := srv.OpenChannel("ipbnch")
+			// Expand OS socket buffers to prevent kernel-level drop bursts
+			if ipConn, ok := pconn.(*net.IPConn); ok {
+				_ = ipConn.SetReadBuffer(4 * 1024 * 1024)
+				_ = ipConn.SetWriteBuffer(4 * 1024 * 1024)
+			}
+
+			ln, err := ListenPacket(pconn, 1400, cfg)
+			if err != nil {
+				_ = pconn.Close()
+				b.Fatalf("ListenPacket constructor failed: %v", err)
+			}
+
+			// Client setup
+			laddr := &net.IPAddr{IP: net.ParseIP(clientIP)}
+			raddr := &net.IPAddr{IP: net.ParseIP("127.0.0.1")}
+			cliConn, err := net.DialIP(testIPProtocol, laddr, raddr)
+			if err != nil {
+				_ = ln.Close()
+				b.Fatalf("DialIP failed: %v", err)
+			}
+			_ = cliConn.SetReadBuffer(4 * 1024 * 1024)
+			_ = cliConn.SetWriteBuffer(4 * 1024 * 1024)
+
+			cli, err := DialConfig(cliConn, cfg)
+			if err != nil {
+				_ = cliConn.Close()
+				_ = ln.Close()
+				b.Fatalf("DialConfig failed: %v", err)
+			}
+
+			srv, err := ln.Accept()
+			if err != nil {
+				_ = cli.Close()
+				_ = cliConn.Close()
+				_ = ln.Close()
+				b.Fatalf("Accept failed: %v", err)
+			}
+
+			defer func() {
+				_ = cli.Close()
+				_ = srv.Close()
+				_ = cliConn.Close()
+				_ = ln.Close()
+			}()
+
+			ch1, err := cli.OpenChannel("ipbnch")
+			if err != nil {
+				b.Fatal(err)
+			}
+			ch2, err := srv.OpenChannel("ipbnch")
+			if err != nil {
+				b.Fatal(err)
+			}
 
 			buf := make([]byte, sz)
 			_, _ = rand.Read(buf)
@@ -561,29 +621,35 @@ func BenchmarkThroughput_RawIP(b *testing.B) {
 			b.ReportAllocs()
 			b.ResetTimer()
 
-			done := make(chan struct{})
+			done := make(chan error, 1)
 			go func() {
 				recv := make([]byte, sz)
 				for i := 0; i < b.N; i++ {
 					if _, err := io.ReadFull(ch2, recv); err != nil {
+						done <- err
 						return
 					}
 				}
-				close(done)
+				done <- nil
 			}()
 
 			for i := 0; i < b.N; i++ {
 				if _, err := ch1.Write(buf); err != nil {
-					b.Fatalf("Write error: %v", err)
+					b.Fatalf("Write error at iteration %d/%d: %v", i, b.N, err)
 				}
 			}
 
-			<-done
-			_ = ch1.CloseWrite()
+			select {
+			case err := <-done:
+				if err != nil {
+					b.Fatalf("Read error: %v", err)
+				}
+			case <-time.After(15 * time.Second):
+				b.Fatal("Benchmark deadlock: receiver timed out waiting for data")
+			}
+
 			_ = ch1.Close()
 			_ = ch2.Close()
-			<-ch1.Done()
-			<-ch2.Done()
 		})
 	}
 }
@@ -595,7 +661,7 @@ func BenchmarkThroughput_RawIP_MultiChannel(b *testing.B) {
 	cfg := DefaultConfig()
 	cfg.Reliability = true
 
-	_, srv, cli, cleanup := createIPSessionPair(b, 1480, cfg, "127.0.0.2")
+	_, srv, cli, cleanup := createIPSessionPair(b, 32*1024, cfg, "127.0.0.2")
 	defer cleanup()
 
 	const numChannels = 8
