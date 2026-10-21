@@ -1970,7 +1970,7 @@ func runPayloadTest(t *testing.T, ch1, ch2 *Channel, sizeBytes int) {
 		t.Fatal("ch2 failed to finalize")
 	}
 	// Small pause to allow peer readLoop to consume and discard trailing wire frames
-	time.Sleep(30 * time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
 
 	// 1. Audit channel-level queues
 	assertChannelClean(t, ch1)
@@ -2011,4 +2011,15 @@ func runPingPongAndClose(t *testing.T, ch1, ch2 *Channel) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("ch2 failed to finalize")
 	}
+
+	// Small pause to allow peer readLoop to consume and discard trailing wire frames
+	time.Sleep(50 * time.Millisecond)
+
+	// 1. Audit channel-level queues
+	assertChannelClean(t, ch1)
+	assertChannelClean(t, ch2)
+
+	// 2. Audit session-level tracking (while sessions are still alive)
+	assertNoInternalSessionLeaks(t, ch1.session)
+	assertNoInternalSessionLeaks(t, ch2.session)
 }
