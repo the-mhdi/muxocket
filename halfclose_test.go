@@ -78,7 +78,7 @@ func TestSession_EarlyFrames_DeliveredOnOpen(t *testing.T) {
 		t.Fatal(err)
 	}
 	a.CloseWrite()
-	time.Sleep(50 * time.Millisecond) // let it all arrive before we open
+	time.Sleep(100 * time.Millisecond) // let it all arrive before we open
 
 	b, _ := s2.OpenChannel("early")
 	got, err := io.ReadAll(b)

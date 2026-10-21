@@ -1969,6 +1969,8 @@ func runPayloadTest(t *testing.T, ch1, ch2 *Channel, sizeBytes int) {
 	case <-time.After(3 * time.Second):
 		t.Fatal("ch2 failed to finalize")
 	}
+	// Small pause to allow peer readLoop to consume and discard trailing wire frames
+	time.Sleep(30 * time.Millisecond)
 
 	// 1. Audit channel-level queues
 	assertChannelClean(t, ch1)

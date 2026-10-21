@@ -199,7 +199,7 @@ func DefaultConfig() *Config {
 		MaxRetransmit:                   8,
 		AckInterval:                     10 * time.Millisecond,
 		StreamingAckRatio:               2,
-		ImmediateACKForLargePackets:     true,
+		ImmediateACKForLargePackets:     false,
 		AllowConnectionResumption:       false,
 		ConnectionResumeTimeout:         5 * time.Second,
 		MaxPendingChannels:              4,
@@ -673,6 +673,10 @@ func (s *Session) streamReadLoop(c io.ReadWriteCloser) {
 			if ch == nil {
 				s.channelsMu.Lock()
 				if ch = s.channels[channelID]; ch == nil && !s.isClosed() {
+					//accept only if we have a pending queue for this channel, otherwise we will drop it
+					//if q := s.pending[channelID]; q != nil {
+					//	s.stashLocked(channelID, pendingFrame{flag: FLG_RST, offset: offset})
+					//}
 					if !s.recentlyClosedLocked(channelID) {
 						s.stashLocked(channelID, pendingFrame{flag: FLG_FIN, offset: offset})
 					}
@@ -697,9 +701,14 @@ func (s *Session) streamReadLoop(c io.ReadWriteCloser) {
 			if ch == nil {
 				s.channelsMu.Lock()
 				if ch = s.channels[channelID]; ch == nil && !s.isClosed() {
-					if !s.recentlyClosedLocked(channelID) {
+					//accept only if we have a pending queue for this channel, otherwise we will drop it
+					if q := s.pending[channelID]; q != nil {
 						s.stashLocked(channelID, pendingFrame{flag: FLG_RST, offset: offset})
 					}
+
+					//if !s.recentlyClosedLocked(channelID) {
+					//	s.stashLocked(channelID, pendingFrame{flag: FLG_RST, offset: offset})
+					//}
 				}
 				s.channelsMu.Unlock()
 			}
@@ -846,7 +855,7 @@ func (s *Session) datagramReadLoop(c io.ReadWriteCloser, pr packetReader) {
 				if ch == nil {
 					s.channelsMu.Lock()
 					if ch = s.channels[channelID]; ch == nil && !s.isClosed() {
-						if !s.recentlyClosedLocked(channelID) {
+						if q := s.pending[channelID]; q != nil {
 							s.stashLocked(channelID, pendingFrame{flag: FLG_RST, offset: offset})
 						}
 					}

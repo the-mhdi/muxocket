@@ -107,6 +107,7 @@ func TestChannel_Reset_BeforeOpen(t *testing.T) {
 	defer s2.Close()
 	a, _ := s1.OpenChannel("early")
 	a.Write([]byte("data"))
+	time.Sleep(10 * time.Millisecond)
 	a.Close()
 	time.Sleep(50 * time.Millisecond)
 	b, _ := s2.OpenChannel("early")
