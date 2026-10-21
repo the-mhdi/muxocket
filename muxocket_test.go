@@ -11,6 +11,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"go.uber.org/goleak"
 )
 
 func createSessionPair(t *testing.T) (*Session, *Session) {
@@ -1585,5 +1587,426 @@ func BenchmarkLatency_Reliable_PingPong(b *testing.B) {
 		if _, err := io.ReadFull(ch1, recv); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+///////////////////uber leak
+
+func TestNoGoroutineLeaks_PayloadSizes(t *testing.T) {
+	sizes := []struct {
+		name string
+		size int
+	}{
+		{"64B", 64},
+		{"1KB", 1 * 1024},
+		{"1400B", 1400},
+		{"32KB", 32 * 1024},
+		{"128KB", 128 * 1024},
+	}
+
+	t.Run("Pipe", func(t *testing.T) {
+		for _, tc := range sizes {
+			t.Run(tc.name, func(t *testing.T) {
+				defer goleak.VerifyNone(t)
+
+				s1, s2 := createSessionPair(t)
+				defer func() {
+					_ = s1.Close()
+					_ = s2.Close()
+					<-s1.Done()
+					<-s2.Done()
+				}()
+
+				ch1, _ := s1.OpenChannel("pipe")
+				ch2, _ := s2.OpenChannel("pipe")
+				runPayloadTest(t, ch1, ch2, tc.size)
+			})
+		}
+	})
+
+	t.Run("TCP", func(t *testing.T) {
+		for _, tc := range sizes {
+			t.Run(tc.name, func(t *testing.T) {
+				defer goleak.VerifyNone(t)
+
+				s1, s2, cleanup := createTCPSessionPair(t)
+				defer func() {
+					cleanup()
+					<-s1.Done()
+					<-s2.Done()
+				}()
+
+				ch1, _ := s1.OpenChannel("tcp")
+				ch2, _ := s2.OpenChannel("tcp")
+				runPayloadTest(t, ch1, ch2, tc.size)
+			})
+		}
+	})
+
+	t.Run("UDP", func(t *testing.T) {
+		for _, tc := range sizes {
+			t.Run(tc.name, func(t *testing.T) {
+				defer goleak.VerifyNone(t)
+
+				cfg := DefaultConfig()
+				cfg.Reliability = true
+				cfg.RetransmitTimeout = 30 * time.Millisecond
+				// Expand buffer to allow multi-frame 128KB bursts
+				cfg.MaxWriteBufferSize = 128
+
+				ln, srv, cli, cleanup := createUDPSessionPair(t, 1400, cfg)
+				_ = ln
+				defer func() {
+					cleanup()
+					<-cli.Done()
+					<-srv.Done()
+				}()
+
+				ch1, _ := cli.OpenChannel("udp")
+				ch2, _ := srv.OpenChannel("udp")
+				runPayloadTest(t, ch1, ch2, tc.size)
+			})
+		}
+	})
+
+	t.Run("Throughput_RawIP", func(t *testing.T) {
+		skipUnlessRawIP(t)
+
+		for idx, tc := range sizes {
+			t.Run(tc.name, func(t *testing.T) {
+				defer goleak.VerifyNone(t)
+
+				cfg := DefaultConfig()
+				cfg.Reliability = true
+				cfg.RetransmitTimeout = 30 * time.Millisecond
+				cfg.MaxWriteBufferSize = 128
+
+				// Use unique loopback alias (127.0.0.2, 127.0.0.3, ...) per subtest
+				clientIP := fmt.Sprintf("127.0.0.%d", idx+2)
+				ln, srv, cli, cleanup := createIPSessionPair(t, 1480, cfg, clientIP)
+				_ = ln
+				defer func() {
+					cleanup()
+					<-cli.Done()
+					<-srv.Done()
+				}()
+
+				ch1, _ := cli.OpenChannel("rawip")
+				ch2, _ := srv.OpenChannel("rawip")
+				runPayloadTest(t, ch1, ch2, tc.size)
+			})
+		}
+	})
+}
+
+func TestNoGoroutineLeaks(t *testing.T) {
+	t.Run("Pipe", func(t *testing.T) {
+		defer goleak.VerifyNone(t)
+
+		s1, s2 := createSessionPair(t)
+		defer func() {
+			_ = s1.Close()
+			_ = s2.Close()
+			<-s1.Done()
+			<-s2.Done()
+		}()
+
+		ch1, _ := s1.OpenChannel("pipe")
+		ch2, _ := s2.OpenChannel("pipe")
+		runPingPongAndClose(t, ch1, ch2)
+	})
+
+	t.Run("TCP", func(t *testing.T) {
+		defer goleak.VerifyNone(t)
+
+		s1, s2, cleanup := createTCPSessionPair(t)
+		defer func() {
+			cleanup()
+			<-s1.Done()
+			<-s2.Done()
+		}()
+
+		ch1, _ := s1.OpenChannel("tcp")
+		ch2, _ := s2.OpenChannel("tcp")
+		runPingPongAndClose(t, ch1, ch2)
+	})
+
+	t.Run("UDP", func(t *testing.T) {
+		defer goleak.VerifyNone(t)
+
+		cfg := DefaultConfig()
+		cfg.Reliability = true
+		cfg.RetransmitTimeout = 30 * time.Millisecond
+
+		ln, srv, cli, cleanup := createUDPSessionPair(t, 1400, cfg)
+		_ = ln
+		defer func() {
+			cleanup()
+			<-cli.Done()
+			<-srv.Done()
+		}()
+
+		ch1, _ := cli.OpenChannel("udp")
+		ch2, _ := srv.OpenChannel("udp")
+		runPingPongAndClose(t, ch1, ch2)
+	})
+
+	t.Run("Throughput_RawIP", func(t *testing.T) {
+		skipUnlessRawIP(t)
+		defer goleak.VerifyNone(t)
+
+		cfg := DefaultConfig()
+		cfg.Reliability = true
+		cfg.RetransmitTimeout = 30 * time.Millisecond
+
+		ln, srv, cli, cleanup := createIPSessionPair(t, 1480, cfg, "127.0.0.2")
+		_ = ln
+		defer func() {
+			cleanup()
+			<-cli.Done()
+			<-srv.Done()
+		}()
+
+		ch1, _ := cli.OpenChannel("rawip")
+		ch2, _ := srv.OpenChannel("rawip")
+		runPingPongAndClose(t, ch1, ch2)
+	})
+}
+
+func TestNoLeaks_AllTransportsAndPayloads(t *testing.T) {
+	sizes := []struct {
+		name string
+		size int
+	}{
+		{"64B", 64},
+		{"1KB", 1 * 1024},
+		{"1400B", 1400},
+		{"32KB", 32 * 1024},
+		{"128KB", 128 * 1024},
+	}
+
+	t.Run("Pipe", func(t *testing.T) {
+		for _, tc := range sizes {
+			t.Run(tc.name, func(t *testing.T) {
+				defer goleak.VerifyNone(t)
+
+				s1, s2 := createSessionPair(t)
+				defer func() {
+					_ = s1.Close()
+					_ = s2.Close()
+					<-s1.Done()
+					<-s2.Done()
+				}()
+
+				ch1, _ := s1.OpenChannel("pipe")
+				ch2, _ := s2.OpenChannel("pipe")
+				runPayloadTest(t, ch1, ch2, tc.size)
+			})
+		}
+	})
+
+	t.Run("TCP", func(t *testing.T) {
+		for _, tc := range sizes {
+			t.Run(tc.name, func(t *testing.T) {
+				defer goleak.VerifyNone(t)
+
+				s1, s2, cleanup := createTCPSessionPair(t)
+				defer func() {
+					cleanup()
+					<-s1.Done()
+					<-s2.Done()
+				}()
+
+				ch1, _ := s1.OpenChannel("tcp")
+				ch2, _ := s2.OpenChannel("tcp")
+				runPayloadTest(t, ch1, ch2, tc.size)
+			})
+		}
+	})
+
+	t.Run("UDP", func(t *testing.T) {
+		for _, tc := range sizes {
+			t.Run(tc.name, func(t *testing.T) {
+				defer goleak.VerifyNone(t)
+
+				cfg := DefaultConfig()
+				cfg.Reliability = true
+				cfg.RetransmitTimeout = 30 * time.Millisecond
+				cfg.MaxWriteBufferSize = 128
+
+				ln, srv, cli, cleanup := createUDPSessionPair(t, 1400, cfg)
+				_ = ln
+				defer func() {
+					cleanup()
+					<-cli.Done()
+					<-srv.Done()
+				}()
+
+				ch1, _ := cli.OpenChannel("udp")
+				ch2, _ := srv.OpenChannel("udp")
+				runPayloadTest(t, ch1, ch2, tc.size)
+			})
+		}
+	})
+
+	t.Run("Throughput_RawIP", func(t *testing.T) {
+		skipUnlessRawIP(t)
+
+		for idx, tc := range sizes {
+			t.Run(tc.name, func(t *testing.T) {
+				defer goleak.VerifyNone(t)
+
+				cfg := DefaultConfig()
+				cfg.Reliability = true
+				cfg.RetransmitTimeout = 30 * time.Millisecond
+				cfg.MaxWriteBufferSize = 128
+
+				clientIP := fmt.Sprintf("127.0.0.%d", idx+2)
+				ln, srv, cli, cleanup := createIPSessionPair(t, 1480, cfg, clientIP)
+				_ = ln
+				defer func() {
+					cleanup()
+					<-cli.Done()
+					<-srv.Done()
+				}()
+
+				ch1, _ := cli.OpenChannel("rawip")
+				ch2, _ := srv.OpenChannel("rawip")
+				runPayloadTest(t, ch1, ch2, tc.size)
+			})
+		}
+	})
+}
+
+func assertNoInternalSessionLeaks(t *testing.T, s *Session) {
+	t.Helper()
+
+	s.channelsMu.RLock()
+	time.Sleep(100 * time.Millisecond) // Allow any pending channel finalizers to run
+	activeCh := len(s.channels)
+	pendingCh := len(s.pending)
+	pendingB := s.pendingBytes
+	s.channelsMu.RUnlock()
+
+	s.arqMu.Lock()
+	activeARQ := len(s.arqSet)
+	s.arqMu.Unlock()
+
+	if activeCh != 0 || pendingCh != 0 || pendingB != 0 || activeARQ != 0 {
+		t.Fatalf("Session internal leak: activeChannels=%d pendingChannels=%d pendingBytes=%d arqSet=%d",
+			activeCh, pendingCh, pendingB, activeARQ)
+	}
+}
+
+// assertChannelClean verifies that a finalized channel has released
+// its reorder map, unacked frames, and ring buffer slots.
+func assertChannelClean(t *testing.T, ch *Channel) {
+	t.Helper()
+
+	ch.unackedMu.Lock()
+	unackedLen := len(ch.unacked)
+	inARQ := ch.inARQ
+	ch.unackedMu.Unlock()
+
+	ch.reorderMu.Lock()
+	reorderLen := len(ch.reorderMap)
+	ch.reorderMu.Unlock()
+
+	ringLen := ch.ring.Length()
+
+	if unackedLen != 0 || inARQ || reorderLen != 0 || ringLen != 0 {
+		t.Fatalf("Channel %s leak: unacked=%d inARQ=%v reorderMap=%d ringLen=%d",
+			ch.Label(), unackedLen, inARQ, reorderLen, ringLen)
+	}
+}
+
+func runPayloadTest(t *testing.T, ch1, ch2 *Channel, sizeBytes int) {
+	t.Helper()
+
+	payload := make([]byte, sizeBytes)
+	if _, err := rand.Read(payload); err != nil {
+		t.Fatalf("rand.Read failed: %v", err)
+	}
+
+	recvBuf := make([]byte, sizeBytes)
+	readErr := make(chan error, 1)
+
+	// Reader runs in background to prevent flow-control deadlocks on large payloads
+	go func() {
+		_, err := io.ReadFull(ch2, recvBuf)
+		readErr <- err
+	}()
+
+	if _, err := ch1.Write(payload); err != nil {
+		t.Fatalf("write failed (%d bytes): %v", sizeBytes, err)
+	}
+
+	select {
+	case err := <-readErr:
+		if err != nil {
+			t.Fatalf("read failed (%d bytes): %v", sizeBytes, err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timeout reading %d bytes", sizeBytes)
+	}
+
+	if !bytes.Equal(recvBuf, payload) {
+		t.Fatalf("payload corrupted during transfer (%d bytes)", sizeBytes)
+	}
+
+	// Close channels and wait for wire teardown (FIN + ACK)
+	_ = ch1.Close()
+	_ = ch2.Close()
+
+	select {
+	case <-ch1.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("ch1 failed to finalize")
+	}
+
+	select {
+	case <-ch2.Done():
+	case <-time.After(3 * time.Second):
+		t.Fatal("ch2 failed to finalize")
+	}
+
+	// 1. Audit channel-level queues
+	assertChannelClean(t, ch1)
+	assertChannelClean(t, ch2)
+
+	// 2. Audit session-level tracking (while sessions are still alive)
+	assertNoInternalSessionLeaks(t, ch1.session)
+	assertNoInternalSessionLeaks(t, ch2.session)
+}
+
+func runPingPongAndClose(t *testing.T, ch1, ch2 *Channel) {
+	t.Helper()
+
+	msg := []byte("hello")
+	if _, err := ch1.Write(msg); err != nil {
+		t.Fatalf("write failed: %v", err)
+	}
+
+	buf := make([]byte, len(msg))
+	if _, err := io.ReadFull(ch2, buf); err != nil {
+		t.Fatalf("read failed: %v", err)
+	}
+	if !bytes.Equal(buf, msg) {
+		t.Fatalf("got %q, want %q", buf, msg)
+	}
+
+	_ = ch1.Close()
+	_ = ch2.Close()
+
+	select {
+	case <-ch1.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("ch1 failed to finalize")
+	}
+
+	select {
+	case <-ch2.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("ch2 failed to finalize")
 	}
 }

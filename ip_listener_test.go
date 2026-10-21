@@ -566,7 +566,7 @@ func BenchmarkThroughput_RawIP(b *testing.B) {
 				_ = ipConn.SetWriteBuffer(4 * 1024 * 1024)
 			}
 
-			ln, err := ListenPacket(pconn, 9000, cfg)
+			ln, err := ListenPacket(pconn, 1400, cfg)
 			if err != nil {
 				_ = pconn.Close()
 				b.Fatalf("ListenPacket constructor failed: %v", err)
@@ -661,7 +661,7 @@ func BenchmarkThroughput_RawIP_MultiChannel(b *testing.B) {
 	cfg := DefaultConfig()
 	cfg.Reliability = true
 
-	_, srv, cli, cleanup := createIPSessionPair(b, 32*1024, cfg, "127.0.0.2")
+	_, srv, cli, cleanup := createIPSessionPair(b, 1500, cfg, "127.0.0.2")
 	defer cleanup()
 
 	const numChannels = 8

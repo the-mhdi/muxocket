@@ -14,29 +14,14 @@ type writeFrame struct {
 	length uint32
 	chID   uint32
 	flag   uint8
-	offset uint64 // 64-bit stream offset
+	offset uint64
 
-	// ack, when set, owns pBuf through a reference count (ARQ frames). The
-	// writer releases its reference after the bytes hit the wire instead of
-	// returning pBuf to the allocator directly.
-	ack *unackedFrame
-	// ackCh marks a coalesced FLG_ACK: the cumulative offset is read from the
-	// channel at flush time, so N received frames produce at most one queued
-	// ACK per channel instead of N frames (or N goroutines when ctrlQueue is
-	// full).
-	ackCh *Channel
-
-	// Coalescing references:
+	ack         *unackedFrame
+	ackCh       *Channel
 	streamFlow  *StreamFlow
 	sessionFlow *SessionFlow
 }
 
-// unackedFrame is shared between the channel's retransmission queue and any
-// number of in-flight writeFrames. refs counts all holders; the slab buffer is
-// returned to the allocator only when the last one lets go. Previously onAck /
-// cleanupReliability could recycle a buffer that was still queued in the
-// writer (e.g. a retransmission, or the first send during close), so recycled
-// memory belonging to someone else was put on the wire.
 type unackedFrame struct {
 	pBuf        *[]byte
 	offset      uint64
@@ -44,10 +29,9 @@ type unackedFrame struct {
 	sentAt      time.Time
 	retransmits int
 	refs        atomic.Int32
-	fin         bool // FIN marker: occupies one sequence unit (offset..offset+1)
+	fin         bool
 }
 
-// end is the cumulative ACK offset that acknowledges this frame.
 func (f *unackedFrame) end() uint64 {
 	if f.fin {
 		return f.offset + 1
@@ -57,12 +41,8 @@ func (f *unackedFrame) end() uint64 {
 
 func (f *unackedFrame) retain() { f.refs.Add(1) }
 
-// unackedPool recycles unackedFrames. Safe because of refs: a frame is put
-// back only when the last holder (unacked queue, writer, retransmission)
-// has released it, and no holder touches it after its own release.
 var unackedPool = sync.Pool{New: func() any { return new(unackedFrame) }}
 
-// newUnackedFrame returns a zeroed frame holding refs references.
 func newUnackedFrame(pBuf *[]byte, offset uint64, length uint32, fin bool, refs int32) *unackedFrame {
 	f := unackedPool.Get().(*unackedFrame)
 	f.pBuf = pBuf
@@ -93,10 +73,6 @@ type reorderFrame struct {
 	length  uint32
 }
 
-// datagramWriter is implemented by message-oriented transports (UDP/IP). The
-// scheduler packs whole frames into datagrams no larger than maxDatagramSize()
-// and never splits a frame across datagrams, so a lost datagram loses whole
-// frames (recoverable by ARQ) instead of desynchronising the byte stream.
 type datagramWriter interface {
 	maxDatagramSize() int
 }
@@ -105,19 +81,23 @@ type writeScheduler struct {
 	session   *Session
 	connMu    sync.RWMutex
 	conn      io.Writer
-	connReady chan struct{} // signalled when conn changes
+	connReady chan struct{}
 	writes    chan writeFrame
 	ctrlQueue chan writeFrame
 	closed    atomic.Bool
 	die       chan struct{}
-	exited    chan struct{} // closed when writeLoop returns
+	exited    chan struct{}
 
-	dgram []byte // scratch buffer for datagram packing
+	dgram []byte
 }
 
 func newWriteScheduler(s *Session, conn io.Writer, queueDepth int) *writeScheduler {
 	if queueDepth <= 0 {
 		queueDepth = 128
+	}
+	ctrlDepth := queueDepth
+	if ctrlDepth < 128 {
+		ctrlDepth = 128
 	}
 
 	ws := &writeScheduler{
@@ -125,7 +105,7 @@ func newWriteScheduler(s *Session, conn io.Writer, queueDepth int) *writeSchedul
 		conn:      conn,
 		connReady: make(chan struct{}, 1),
 		writes:    make(chan writeFrame, queueDepth),
-		ctrlQueue: make(chan writeFrame, 64),
+		ctrlQueue: make(chan writeFrame, ctrlDepth),
 		die:       make(chan struct{}),
 		exited:    make(chan struct{}),
 	}
@@ -169,40 +149,35 @@ func (ws *writeScheduler) compactAndResolveControlFrames(b *batchState, n int) i
 	for i := 0; i < n; i++ {
 		f := &b.frames[i]
 
-		// 1. Resolve late-bound ACK offset
 		if ch := f.ackCh; ch != nil {
 			ch.ackPending.Store(false)
 			f.offset = ch.ackOffset.Load()
 		}
 
-		// 2. Resolve late-bound Stream Window Update delta
 		if sf := f.streamFlow; sf != nil {
 			delta := sf.unflushed.Swap(0)
 			sf.updPending.Store(false)
 			if delta <= 0 {
 				releaseFrame(f)
 				*f = writeFrame{}
-				continue // discard empty update
+				continue
 			}
 			f.length = uint32(delta)
 		}
 
-		// 3. Resolve late-bound Session Window Update delta
 		if sf := f.sessionFlow; sf != nil {
 			delta := sf.unflushed.Swap(0)
 			sf.updPending.Store(false)
 			if delta <= 0 {
 				releaseFrame(f)
 				*f = writeFrame{}
-				continue // discard empty update
+				continue
 			}
 			f.length = uint32(delta)
 		}
 
-		// 4. In-batch Deduplication
 		merged := false
 		if f.flag == FLG_ACK {
-			// If an earlier ACK for the same channel exists in this batch, keep the newer offset
 			for j := 0; j < outIdx; j++ {
 				if b.frames[j].flag == FLG_ACK && b.frames[j].chID == f.chID {
 					if f.offset > b.frames[j].offset {
@@ -213,7 +188,6 @@ func (ws *writeScheduler) compactAndResolveControlFrames(b *batchState, n int) i
 				}
 			}
 		} else if f.flag == FLG_UPD {
-			// If an earlier UPD for the same channel/session exists, combine the credits
 			for j := 0; j < outIdx; j++ {
 				if b.frames[j].flag == FLG_UPD && b.frames[j].chID == f.chID {
 					b.frames[j].length += f.length
@@ -238,18 +212,13 @@ func (ws *writeScheduler) compactAndResolveControlFrames(b *batchState, n int) i
 	return outIdx
 }
 
-// batchState holds the writer's reusable scratch arrays.
 type batchState struct {
 	hdrs   [MaxBatchFramesInWriter + 1][17]byte
 	raw    [(MaxBatchFramesInWriter + 1) * 2][]byte
 	frames [MaxBatchFramesInWriter + 1]writeFrame
-	// bufs is the net.Buffers value handed to WriteTo. Keeping it in the
-	// (heap-allocated, reused) batchState stops WriteTo's pointer receiver
-	// from forcing a fresh heap allocation on every batch.
-	bufs net.Buffers
+	bufs   net.Buffers
 }
 
-// writeBatch encodes and writes frames, then releases their buffers and zeroes slots.
 func (ws *writeScheduler) writeBatch(b *batchState, writer io.Writer, n int) error {
 	outCount := ws.compactAndResolveControlFrames(b, n)
 	if outCount == 0 {
@@ -285,11 +254,9 @@ func (ws *writeScheduler) writeBatch(b *batchState, writer io.Writer, n int) err
 			b.raw[i] = nil
 		}
 	}
-
 	return err
 }
 
-// collect fills b.frames starting at index start without blocking.
 func (ws *writeScheduler) collect(b *batchState, start int) int {
 	n := start
 	for n < MaxBatchFramesInWriter {
@@ -334,9 +301,6 @@ func (ws *writeScheduler) writeLoop() {
 		b.frames[0] = firstFrame
 		batchCount := ws.collect(b, 1)
 
-		// While suspended (conn == nil) wait for a resumed transport instead of
-		// silently dropping the batch. The old code `continue`d here, dropping
-		// frames and skipping the buffer release.
 		var writer io.Writer
 		for {
 			writer = ws.currentConn()
@@ -356,16 +320,11 @@ func (ws *writeScheduler) writeLoop() {
 		}
 
 		if err := ws.writeBatch(b, writer, batchCount); err != nil {
-			// Don't exit: the old code returned here, so after a successful
-			// resumption the session had no writer and every Write blocked
-			// forever. Report the failure and wait for the next transport.
 			if rwc, ok := writer.(io.ReadWriteCloser); ok {
 				ws.session.handleDisconnect(rwc)
 			} else {
 				ws.session.handleDisconnect(nil)
 			}
-			// If handleDisconnect ignored us (stale) but conn is still the
-			// failing one, avoid a hot loop.
 			if ws.currentConn() == writer {
 				ws.alterConnIfSame(writer)
 			}
@@ -373,13 +332,8 @@ func (ws *writeScheduler) writeLoop() {
 	}
 }
 
-// gracefulFlushTimeout bounds how long Close spends flushing queued frames.
 const gracefulFlushTimeout = 500 * time.Millisecond
 
-// finalFlush runs on Close: it writes whatever is still queued (final data,
-// FINs, ACKs) and then a GOAWAY so the peer closes immediately instead of
-// treating the dropped transport as a network failure and waiting out the
-// resumption grace period. Previously queued frames were simply discarded.
 func (ws *writeScheduler) finalFlush(b *batchState) {
 	defer ws.drainAndCleanup()
 	writer := ws.currentConn()
@@ -400,14 +354,12 @@ func (ws *writeScheduler) finalFlush(b *batchState) {
 		}
 	}
 	if ws.session.goAwayRecv.Load() {
-		return // peer is already gone
+		return
 	}
 	b.frames[0] = writeFrame{flag: FLG_GOAWAY}
 	_ = ws.writeBatch(b, writer, 1)
 }
 
-// alterConnIfSame clears the writer's conn if it is still w (used when a
-// write failed but the session-level conn bookkeeping didn't change it).
 func (ws *writeScheduler) alterConnIfSame(w io.Writer) {
 	ws.connMu.Lock()
 	if ws.conn == w {
@@ -456,7 +408,6 @@ func (ws *writeScheduler) flushDatagrams(w io.Writer, frames []writeFrame, max i
 		}
 		putHeader(&h, f)
 		if need > max {
-			// Oversized frame (misconfiguration): send it on its own.
 			tmp := make([]byte, 0, need)
 			tmp = append(append(tmp, h[:]...), payload...)
 			if _, err := w.Write(tmp); err != nil {

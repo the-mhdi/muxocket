@@ -152,12 +152,15 @@ type Config struct {
 	KeepAliveInterval       time.Duration
 	KeepAliveTimeout        time.Duration
 	MaxUnknownChannelErrors uint32 //default 128, if a session receives more than this number of unknown channel errors, it will close the session
+
 	// Reliability Engine (ARQ)
 	Reliability       bool          // Enable ARQ, stream offsets, in-order reassembly, and ACKs
 	RetransmitTimeout time.Duration // Base RTO
 	MaxRetransmit     int           // Max attempts before closing channel
 	AckInterval       time.Duration // Delay ACK window
-
+	//for high throughput connections with Reliability on its better to set this to 4 , default: 2; <=1: immediate ACK on every packet
+	StreamingAckRatio           uint32 // Acknowledge every Nth in-order packet during continuous bursts
+	ImmediateACKForLargePackets bool   //default false
 	// Resumption Configuration
 	AllowConnectionResumption bool
 	ConnectionResumeTimeout   time.Duration
@@ -195,6 +198,8 @@ func DefaultConfig() *Config {
 		RetransmitTimeout:               150 * time.Millisecond,
 		MaxRetransmit:                   8,
 		AckInterval:                     10 * time.Millisecond,
+		StreamingAckRatio:               2,
+		ImmediateACKForLargePackets:     true,
 		AllowConnectionResumption:       false,
 		ConnectionResumeTimeout:         5 * time.Second,
 		MaxPendingChannels:              4,
@@ -250,6 +255,10 @@ func NewSessionWithID(conn io.ReadWriteCloser, cfg *Config, id string) *Session 
 	if cfg.MaxRetransmit == 0 {
 		cfg.MaxRetransmit = 8
 	}
+	if cfg.StreamingAckRatio == 0 {
+		cfg.StreamingAckRatio = 2
+	}
+
 	if cfg.MaxUnknownChannelErrors == 0 {
 		cfg.MaxUnknownChannelErrors = 128
 	}
