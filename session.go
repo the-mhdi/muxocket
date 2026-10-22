@@ -196,7 +196,7 @@ func DefaultConfig() *Config {
 		KeepAliveTimeout:                30 * time.Second,
 		Reliability:                     false,
 		RetransmitTimeout:               150 * time.Millisecond,
-		MaxRetransmit:                   8,
+		MaxRetransmit:                   16,
 		AckInterval:                     10 * time.Millisecond,
 		StreamingAckRatio:               2,
 		ImmediateACKForLargePackets:     false,
@@ -253,7 +253,7 @@ func NewSessionWithID(conn io.ReadWriteCloser, cfg *Config, id string) *Session 
 	}
 
 	if cfg.MaxRetransmit == 0 {
-		cfg.MaxRetransmit = 8
+		cfg.MaxRetransmit = 16
 	}
 	if cfg.StreamingAckRatio == 0 {
 		cfg.StreamingAckRatio = 2

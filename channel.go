@@ -331,6 +331,12 @@ func (c *Channel) ReadFrom(r io.Reader) (int64, error) {
 	}
 }
 
+// sendFromRead sends (*pBuf)[:n]. Normally the buffer itself becomes the
+// frame payload (no copy). It is copied instead when the send window only
+// allows part of it, or, with Reliability, when the read was small: an ARQ
+// frame keeps its buffer until acknowledged, and pinning a full-frame slab for
+// every tiny read would multiply memory use far beyond the window.
+// keep reports whether the caller still owns pBuf.
 func (c *Channel) sendFromRead(pBuf *[]byte, n int) (sent int, keep bool, err error) {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()

@@ -538,6 +538,7 @@ func BenchmarkThroughput_RawIP(b *testing.B) {
 		1 * 1024,
 		4 * 1024,
 		16 * 1024,
+		32 * 1024,
 		64 * 1024,
 	}
 
@@ -550,9 +551,11 @@ func BenchmarkThroughput_RawIP(b *testing.B) {
 			cfg.Reliability = true
 			cfg.MaxWriteBufferSize = 512
 			cfg.RetransmitTimeout = 50 * time.Millisecond
+			cfg.MaxRetransmit = 16
+			cfg.StreamingAckRatio = 2
 			// Limit in-flight window so it doesn't overrun raw socket queues
-			cfg.InitialStreamWindow = 512 * 1024
-			cfg.InitialSessionWindow = 5 * 1024 * 1024
+			cfg.InitialStreamWindow = 1 * 1024 * 1024
+			cfg.InitialSessionWindow = 8 * 1024 * 1024
 
 			// Server setup
 			pconn, err := net.ListenPacket(testIPProtocol, "127.0.0.1")
@@ -565,7 +568,7 @@ func BenchmarkThroughput_RawIP(b *testing.B) {
 				_ = ipConn.SetReadBuffer(4 * 1024 * 1024)
 				_ = ipConn.SetWriteBuffer(4 * 1024 * 1024)
 			}
-
+			//2082 < ,gives 1 alloc on 1k packet
 			ln, err := ListenPacket(pconn, 1400, cfg)
 			if err != nil {
 				_ = pconn.Close()
